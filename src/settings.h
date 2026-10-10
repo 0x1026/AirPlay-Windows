@@ -1,12 +1,17 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
 
 namespace ap::airplay { struct LiveSettings; }
 
 namespace ap {
 
+inline constexpr const char* default_receiver_name = "AirPlay-Windows";
+bool valid_receiver_name(const std::string& name);
+
 struct PersistentSettings {
+    std::string receiver_name = default_receiver_name;
     int  mirror_width   = 0;
     int  mirror_height  = 0;
     bool hevc_enabled   = true;

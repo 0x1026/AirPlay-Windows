@@ -149,24 +149,36 @@ bool StreamSession::setup_legacy(const std::string& transport, StreamPorts& allo
     return true;
 }
 
-bool StreamSession::setup_session(uint16_t& event_port, uint16_t& timing_port) {
-    auto [e_sock, e_port] = bind_udp();
-    if (e_sock == INVALID_SOCK) {
-        LOG_ERROR << "SETUP (airplay2 session): cannot bind event socket";
+bool StreamSession::setup_session(
+    uint16_t& event_port,
+    uint16_t& timing_port,
+    const std::vector<unsigned char>& pair_verify_secret) {
+    // AirPlay 2's event channel is TCP, not UDP. The sender connects back to
+    // the eventPort from our SETUP response and keeps the socket open. Besides
+    // sender -> receiver events, that same bidirectional connection carries
+    // receiver -> sender /command requests (MediaRemote control).
+    event_channel_ = std::make_shared<AirPlayEventChannel>();
+    if (!event_channel_->start(event_port, pair_verify_secret)) {
+        LOG_ERROR << "SETUP (airplay2 session): cannot start TCP event channel";
+        event_channel_.reset();
         return false;
     }
+
     auto [t_sock, t_port] = bind_udp();
     if (t_sock == INVALID_SOCK) {
         LOG_ERROR << "SETUP (airplay2 session): cannot bind timing socket";
-        ap::net::close_socket(e_sock);
+        event_channel_->stop();
+        event_channel_.reset();
         return false;
     }
-    event_sock_      = e_sock;
-    ap2_timing_sock  = t_sock;
-    event_port       = e_port;
-    timing_port      = t_port;
+
+    ap2_timing_sock = t_sock;
+    timing_port = t_port;
+    set_active_event_channel(event_channel_);
+
     LOG_INFO << "SETUP session=" << session_id_
-             << " airplay2 event=" << e_port << " timing=" << t_port;
+             << " airplay2 event(TCP)=" << event_port
+             << " timing(UDP)=" << t_port;
     return true;
 }
 
@@ -222,31 +234,34 @@ bool StreamSession::setup_stream(int type,
              << " (UDP) data=" << d_port << " control=" << c_port;
 
     if (type == 96) {
-        // Start the audio receiver on the data socket. It takes ownership.
+        // Timestamp-synchronized audio needs both UDP sockets plus the NTP
+        // clock mapping established by the session-level SETUP.
         audio_ = std::make_unique<ap::audio::AudioReceiver>();
         ap::audio::AudioReceiver::Config ac;
-        ac.data_sock   = d_sock;
-        ac.aes_key     = opts.aes_key;
-        ac.aes_iv      = opts.aes_iv;
-        ac.ct          = opts.ct;
-        ac.sample_rate = opts.sample_rate;
-        ac.renderer    = renderer_;
+        ac.data_sock    = d_sock;
+        ac.control_sock = c_sock;
+        ac.aes_key      = opts.aes_key;
+        ac.aes_iv       = opts.aes_iv;
+        ac.ct           = opts.ct;
+        ac.sample_rate  = opts.sample_rate;
+        ac.ntp          = ntp_.get();
+        ac.renderer     = renderer_;
+
         if (!audio_->start(std::move(ac))) {
-            LOG_WARN << "SETUP stream 96: AudioReceiver failed to start "
-                        "(UDP socket left bound, no decrypt)";
-            // If start() failed before taking ownership, we close the sock here.
+            LOG_WARN << "SETUP stream 96: AudioReceiver failed to start";
+            // start() does not take ownership on failure.
             ap::net::close_socket(d_sock);
+            ap::net::close_socket(c_sock);
             audio_.reset();
+            return false;
         }
 
-        // Control socket: iOS sends retransmit/feedback packets here; we
-        // just keep it bound so iOS isn't flooded with ICMP unreachables.
         StreamChannel ch;
         ch.type         = type;
         ch.data_port    = d_port;
         ch.control_port = c_port;
-        ch.data_sock    = INVALID_SOCK;   // consumed by AudioReceiver
-        ch.control_sock = c_sock;
+        ch.data_sock    = INVALID_SOCK;   // owned by AudioReceiver
+        ch.control_sock = INVALID_SOCK;   // owned by AudioReceiver
         channels_.push_back(ch);
         return true;
     }
@@ -284,13 +299,26 @@ void StreamSession::stop_stream(int type) {
     }
 }
 
+bool StreamSession::send_event_update_info(
+    const std::vector<unsigned char>& info_plist) {
+    if (!event_channel_) {
+        LOG_WARN << "AirPlay event updateInfo skipped: no event channel";
+        return false;
+    }
+    return event_channel_->send_update_info(info_plist);
+}
+
 bool StreamSession::start_ntp(const std::string& remote_ip, uint16_t remote_port) {
     if (ap2_timing_sock == INVALID_SOCK) {
         LOG_ERROR << "start_ntp: timing socket not bound (call setup_session first)";
         return false;
     }
     ntp_ = std::make_unique<NtpClient>();
-    return ntp_->start(ap2_timing_sock, remote_ip, remote_port);
+    if (!ntp_->start(ap2_timing_sock, remote_ip, remote_port)) {
+        ntp_.reset();
+        return false;
+    }
+    return true;
 }
 
 void StreamSession::set_audio_volume_db(float db) {
@@ -303,13 +331,22 @@ void StreamSession::teardown() {
              << " mirror=" << (mirror_ ? "yes" : "no")
              << " audio=" << (audio_ ? "yes" : "no")
              << " channels=" << channels_.size();
-    if (ntp_)    { LOG_INFO << "teardown: ntp stop"; ntp_->stop(); ntp_.reset(); }
-    if (mirror_) { LOG_INFO << "teardown: mirror stop"; mirror_->stop(); mirror_.reset(); }
+    // AudioReceiver holds a non-owning NtpClient pointer for timestamped
+    // playout, so stop audio before destroying the NTP clock.
     if (audio_)  { LOG_INFO << "teardown: audio stop"; audio_->stop();  audio_.reset(); }
+    if (mirror_) { LOG_INFO << "teardown: mirror stop"; mirror_->stop(); mirror_.reset(); }
+    if (ntp_)    { LOG_INFO << "teardown: ntp stop"; ntp_->stop(); ntp_.reset(); }
+
+    if (event_channel_) {
+        LOG_INFO << "teardown: event channel stop";
+        clear_active_event_channel(event_channel_);
+        event_channel_->stop();
+        event_channel_.reset();
+    }
 
     LOG_INFO << "teardown: closing session sockets";
     for (auto* sp : { &data_sock_, &ctrl_sock_, &timing_sock_,
-                       &event_sock_, &ap2_timing_sock }) {
+                       &ap2_timing_sock }) {
         if (*sp != INVALID_SOCK) {
             ap::net::close_socket(*sp);
             *sp = INVALID_SOCK;

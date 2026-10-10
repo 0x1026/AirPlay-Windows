@@ -1,6 +1,7 @@
 #include "video/video_renderer.h"
 #include "video/video_recorder.h"
 #include "airplay/live_settings.h"
+#include "platform/windows_media_session.h"
 #include "log.h"
 
 #include <SDL.h>
@@ -410,13 +411,28 @@ SDL_Rect fit_inside(int src_w, int src_h, int win_w, int win_h) {
 
 } // namespace
 
-VideoRenderer::VideoRenderer() : recorder_(std::make_unique<VideoRecorder>()) {}
+VideoRenderer::VideoRenderer()
+    : recorder_(std::make_unique<VideoRecorder>()),
+      media_session_(std::make_unique<ap::platform::WindowsMediaSession>()) {}
 VideoRenderer::~VideoRenderer() { stop(); }
 
-bool VideoRenderer::start(const std::string& title) {
+bool VideoRenderer::start(const std::string& title, bool start_hidden) {
+    closed_.store(false);
+    window_visible_.store(!start_hidden);
+    visibility_request_.store(0);
     running_ = true;
-    thread_  = std::thread(&VideoRenderer::run, this, title);
+    thread_  = std::thread(&VideoRenderer::run, this, title, start_hidden);
     return true;
+}
+
+void VideoRenderer::show_window() {
+    visibility_request_.store(1);
+    cv_.notify_all();
+}
+
+void VideoRenderer::hide_window() {
+    visibility_request_.store(-1);
+    cv_.notify_all();
 }
 
 void VideoRenderer::stop() {
@@ -428,6 +444,7 @@ void VideoRenderer::stop() {
 
 void VideoRenderer::push_cover_art(const uint8_t* jpeg, std::size_t size) {
     if (!jpeg || size == 0) return;
+    if (media_session_) media_session_->set_cover_art(jpeg, size);
     std::lock_guard<std::mutex> lock(cover_mtx_);
     cover_jpeg_.assign(jpeg, jpeg + size);
     cover_dirty_ = true;
@@ -435,6 +452,7 @@ void VideoRenderer::push_cover_art(const uint8_t* jpeg, std::size_t size) {
 }
 
 void VideoRenderer::push_progress(uint32_t elapsed_ms, uint32_t total_ms) {
+    if (media_session_) media_session_->set_timeline(elapsed_ms, total_ms);
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     const int64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
     progress_elapsed_ms_.store(elapsed_ms, std::memory_order_relaxed);
@@ -445,6 +463,7 @@ void VideoRenderer::push_progress(uint32_t elapsed_ms, uint32_t total_ms) {
 
 void VideoRenderer::push_playback_rate(float rate) {
     const bool new_playing = rate > 0.5f;
+    if (media_session_) media_session_->set_playing(new_playing);
     const bool old_playing = playing_.exchange(new_playing, std::memory_order_relaxed);
     if (old_playing != new_playing) {
         LOG_INFO << "VideoRenderer playback state: "
@@ -471,6 +490,7 @@ bool VideoRenderer::in_flush_grace() const {
 
 void VideoRenderer::clear_session() {
     LOG_INFO << "VideoRenderer clear_session: reset cover / metadata / progress / video frame";
+    if (media_session_) media_session_->clear();
     // Drop the last decoded frame so the stage falls back to the
     // idle "Waiting for AirPlay" screen instead of freezing on the
     // last picture from the disconnected device. Both producer slots
@@ -609,12 +629,14 @@ void VideoRenderer::record_payload_bytes(std::size_t n) {
 }
 
 void VideoRenderer::set_active_device(DeviceInfo info) {
+    if (media_session_) media_session_->set_active(true);
     std::lock_guard<std::mutex> lock(device_mtx_);
     device_     = std::move(info);
     has_device_ = true;
 }
 
 void VideoRenderer::clear_active_device() {
+    if (media_session_) media_session_->set_active(false);
     std::lock_guard<std::mutex> lock(device_mtx_);
     has_device_ = false;
     device_     = {};
@@ -643,6 +665,7 @@ void VideoRenderer::set_idle_info(const std::string& name,
 void VideoRenderer::push_metadata(const std::string& title,
                                   const std::string& artist,
                                   const std::string& album) {
+    if (media_session_) media_session_->set_metadata(title, artist, album);
     std::lock_guard<std::mutex> lock(meta_mtx_);
     if (meta_title_ == title && meta_artist_ == artist && meta_album_ == album) {
         return;   // no change, no need to re-render
@@ -740,7 +763,7 @@ void VideoRenderer::push_frame_nv12(const uint8_t* y,  int y_stride,
     cv_.notify_one();
 }
 
-void VideoRenderer::run(const std::string& title) {
+void VideoRenderer::run(const std::string& title, bool start_hidden) {
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         LOG_ERROR << "SDL_Init failed: " << SDL_GetError();
         running_ = false;
@@ -753,10 +776,12 @@ void VideoRenderer::run(const std::string& title) {
     // receivers. Must be set before SDL_CreateRenderer to take effect.
     SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "linear");
 
+    const Uint32 window_flags = SDL_WINDOW_RESIZABLE
+        | (start_hidden ? SDL_WINDOW_HIDDEN : SDL_WINDOW_SHOWN);
     SDL_Window*   window   = SDL_CreateWindow(
         title.c_str(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         kDefaultWinWidth, kDefaultWinHeight,
-        SDL_WINDOW_RESIZABLE);
+        window_flags);
     // Read the initial vsync preference from LiveSettings (default
     // true). Toggling at runtime is handled by SDL_RenderSetVSync
     // below in the render loop.
@@ -773,12 +798,27 @@ void VideoRenderer::run(const std::string& title) {
         LOG_ERROR << "SDL window/renderer create failed: " << SDL_GetError();
         if (renderer) SDL_DestroyRenderer(renderer);
         if (window)   SDL_DestroyWindow(window);
-        SDL_Quit();
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
         running_ = false;
         return;
     }
+    window_visible_.store(!start_hidden);
+
+#if defined(_WIN32)
+    if (media_session_) {
+        SDL_SysWMinfo wm_info;
+        SDL_VERSION(&wm_info.version);
+        if (SDL_GetWindowWMInfo(window, &wm_info)) {
+            media_session_->start(reinterpret_cast<void*>(wm_info.info.win.window));
+        } else {
+            LOG_WARN << "SMTC: SDL_GetWindowWMInfo failed: " << SDL_GetError();
+        }
+    }
+#endif
+
     LOG_INFO << "VideoRenderer window up (" << kDefaultWinWidth
-             << 'x' << kDefaultWinHeight << ", resizable)";
+             << 'x' << kDefaultWinHeight << ", resizable"
+             << (start_hidden ? ", hidden" : "") << ')';
 
     // Win11 Mica backdrop. No-op on pre-Win11 — caller sees a regular
     // opaque window chrome instead of the subtle acrylic blur.
@@ -962,6 +1002,20 @@ void VideoRenderer::run(const std::string& title) {
     };
 
     while (running_.load()) {
+        // Tray requests are marshalled onto the renderer thread. SDL window
+        // operations from the Win32 tray thread are intentionally avoided.
+        const int visibility = visibility_request_.exchange(0);
+        if (visibility > 0) {
+            SDL_ShowWindow(window);
+            SDL_RaiseWindow(window);
+            window_visible_.store(true);
+            LOG_INFO << "VideoRenderer window shown from tray";
+        } else if (visibility < 0) {
+            SDL_HideWindow(window);
+            window_visible_.store(false);
+            LOG_INFO << "VideoRenderer window hidden to tray";
+        }
+
         // Sync the SDL window border to the chromeless toggle. In
         // fullscreen the border is irrelevant (SDL handles it via
         // the fullscreen flag). Otherwise: borderless when the user
@@ -1030,8 +1084,16 @@ void VideoRenderer::run(const std::string& title) {
         while (SDL_PollEvent(&e)) {
             // Always feed ImGui first so focus / hover / capture work.
             ImGui_ImplSDL2_ProcessEvent(&e);
-            if (e.type == SDL_QUIT) {
-                LOG_INFO << "VideoRenderer received SDL_QUIT";
+            if (e.type == SDL_QUIT ||
+                (e.type == SDL_WINDOWEVENT &&
+                 e.window.event == SDL_WINDOWEVENT_CLOSE)) {
+                if (close_hides_.load()) {
+                    LOG_INFO << "VideoRenderer close requested — hiding to tray";
+                    SDL_HideWindow(window);
+                    window_visible_.store(false);
+                    continue;
+                }
+                LOG_INFO << "VideoRenderer received close/quit";
                 closed_  = true;
                 running_ = false;
                 break;
@@ -1046,7 +1108,13 @@ void VideoRenderer::run(const std::string& title) {
                         // fullscreen first, then chromeless, then quit.
                         if (fullscreen)         toggle_fullscreen();
                         else if (ui.chromeless) ui.chromeless = false;
-                        else { closed_ = true; running_ = false; }
+                        else if (close_hides_.load()) {
+                            SDL_HideWindow(window);
+                            window_visible_.store(false);
+                        } else {
+                            closed_ = true;
+                            running_ = false;
+                        }
                         break;
                     case SDLK_f:
                     case SDLK_F11:
@@ -1080,6 +1148,15 @@ void VideoRenderer::run(const std::string& title) {
             }
         }
         if (!running_.load()) break;
+
+        // Do not render continuously while hidden in the tray. Network,
+        // audio and decode threads continue normally; the latest video frame
+        // remains in the single-slot producer buffer and is picked up when
+        // the window is shown again.
+        if (!window_visible_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
 
         // --- Consume pending video frame -----------------------------
         // Two producers feed the slot:
@@ -2095,9 +2172,15 @@ void VideoRenderer::run(const std::string& title) {
     ImGui_ImplSDLRenderer2_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     ImGui::DestroyContext();
+    if (media_session_) media_session_->stop();
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
-    SDL_Quit();
+    window_visible_.store(false);
+
+    // VideoRenderer owns the SDL video subsystem only. Audio may still be
+    // active until main() stops the AirPlay server and joins AudioReceiver,
+    // so a global SDL_Quit() here would invalidate the live audio device.
+    SDL_QuitSubSystem(SDL_INIT_VIDEO);
     LOG_INFO << "VideoRenderer stopped";
 }
 

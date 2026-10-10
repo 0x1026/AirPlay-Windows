@@ -388,13 +388,21 @@ Response setup_airplay2_path(ClientSession& session, const Request& req) {
         }
 
         uint16_t event_port = 0, timing_port = 0;
-        if (!session.streams->setup_session(event_port, timing_port)) {
+        if (!session.pair_verify ||
+            session.pair_verify->state() != ap::crypto::PairVerifySession::State::Verified ||
+            session.pair_verify->ecdh_secret().size() != 32) {
+            LOG_ERROR << "airplay2 SETUP: encrypted event channel requires a "
+                         "verified 32-byte pair-verify shared secret";
+            r.status_code = 470;
+            r.status_text = "Connection Authorization Required";
+            return r;
+        }
+        if (!session.streams->setup_session(
+                event_port, timing_port, session.pair_verify->ecdh_secret())) {
             r.status_code = 500; r.status_text = "Internal Server Error";
             return r;
         }
-        // `event_port` is bound but unused; UxPlay always returns 0.
-        (void)event_port;
-        response.add_session(timing_port);
+        response.add_session(event_port, timing_port);
 
         // Start the NTP client polling iOS's timing server. Without this,
         // iOS tears down the session ~8 seconds after stream SETUP because

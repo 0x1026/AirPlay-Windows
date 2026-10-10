@@ -1,5 +1,6 @@
 #pragma once
 
+#include "airplay/event_channel.h"
 #include "airplay/mirror_listener.h"
 #include "airplay/ntp_client.h"
 #include "audio/audio_receiver.h"
@@ -53,7 +54,8 @@ public:
     void set_renderer(ap::video::VideoRenderer* r) { renderer_ = r; }
 
     bool setup_legacy(const std::string& transport_header, StreamPorts& allocated);
-    bool setup_session(uint16_t& event_port, uint16_t& timing_port);
+    bool setup_session(uint16_t& event_port, uint16_t& timing_port,
+                       const std::vector<unsigned char>& pair_verify_secret);
 
     // Per-stream setup options.
     //   Type 110 (mirror video, TCP): aes_key + stream_connection_id drive
@@ -72,6 +74,11 @@ public:
 
     bool setup_stream(int type, uint16_t& data_port, uint16_t& control_port,
                       const StreamOpts& opts);
+
+    // Initialise the encrypted AirPlay 2 event channel after RECORD by
+    // sending the mandatory receiver->sender `updateInfo` command. The
+    // payload is the same binary plist served by GET /info.
+    bool send_event_update_info(const std::vector<unsigned char>& info_plist);
 
     // Start the NTP client thread that polls iOS's timing server at
     // (remote_ip, remote_port) from our timing socket bound by setup_session().
@@ -97,8 +104,8 @@ private:
     socket_t    timing_sock_ = INVALID_SOCK;
 
     // AirPlay 2 path state.
-    socket_t    event_sock_     = INVALID_SOCK;
-    socket_t    ap2_timing_sock = INVALID_SOCK;
+    std::shared_ptr<AirPlayEventChannel>          event_channel_;
+    socket_t                                    ap2_timing_sock = INVALID_SOCK;
     std::vector<StreamChannel>                    channels_;   // audio streams (UDP)
     std::unique_ptr<MirrorListener>               mirror_;     // video stream (TCP)
     std::unique_ptr<NtpClient>                    ntp_;

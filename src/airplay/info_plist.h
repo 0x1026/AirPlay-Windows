@@ -8,13 +8,17 @@ namespace ap::airplay {
 
 // Build the binary-plist payload returned for `GET /info`.
 //
-// Structure and field set mirror UxPlay's `plist/info.plist` (iOS 17-safe
-// baseline). Values specific to this receiver (deviceid, name, pi, model,
-// sourceVersion, features) come from `ctx`; everything else is a known-good
-// constant that lets iOS progress past /info into the pair-setup phase.
-//
-// Returns an empty vector on failure (libplist unavailable or allocation
-// error). Caller should fall back to the text placeholder in that case.
+// Structure and field set mirror UxPlay's `plist/info.plist` baseline. Values
+// specific to this receiver (deviceid, name, pi, model, sourceVersion,
+// features) come from `ctx`.
 std::vector<unsigned char> build_info_plist(const DeviceContext& ctx);
+
+// Build the richer receiver-info dictionary placed in the AirPlay 2 event
+// channel's `{ "type": "updateInfo", "value": ... }` command.
+//
+// This intentionally is not identical to GET /info: modern senders expect
+// event-channel fields such as featuresEx, txtAirPlay, supportedFormats,
+// protocolVersion and playbackCapabilities.
+std::vector<unsigned char> build_event_info_plist(const DeviceContext& ctx);
 
 } // namespace ap::airplay

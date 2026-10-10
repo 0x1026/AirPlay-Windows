@@ -1,5 +1,6 @@
 #include "airplay/server.h"
 #include "airplay/client_session.h"
+#include "airplay/info_plist.h"
 #include "airplay/reverse_channel.h"
 #include "log.h"
 
@@ -48,6 +49,22 @@ void Server::handle_client(ap::net::ClientSocket client) {
                               static_cast<int>(wire.size())) < 0) {
             LOG_WARN << client.peer << ": send failed";
             break;
+        }
+
+        // AirPlay 2 event-channel initialisation is receiver-driven. The
+        // sender connects to eventPort during session SETUP, then after the
+        // RECORD response it expects us to POST an encrypted `updateInfo`
+        // command on that event channel. MediaRemote commands can be silently
+        // ignored until this exchange has completed, so do it strictly after
+        // the RECORD 200 OK has gone out on the control connection.
+        if (req.method == "RECORD" && session.streams) {
+            const auto info = build_event_info_plist(ctx_);
+            if (info.empty()) {
+                LOG_WARN << "AirPlay event updateInfo skipped: event info plist build failed";
+            } else if (!session.streams->send_event_update_info(info)) {
+                LOG_WARN << "AirPlay event updateInfo was not acknowledged; "
+                            "MediaRemote controls will remain disabled for this session";
+            }
         }
     }
     if (!session.reverse_session_id.empty()) {

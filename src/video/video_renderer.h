@@ -16,6 +16,7 @@ struct AVFrame;
 }
 
 namespace ap::airplay { struct LiveSettings; }
+namespace ap::platform { class WindowsMediaSession; }
 
 namespace ap::video {
 
@@ -57,8 +58,21 @@ public:
     VideoRenderer& operator=(const VideoRenderer&) = delete;
 
     // Initialise SDL, create the window at a default size, start the
-    // rendering thread. Returns false on SDL failure.
-    bool start(const std::string& title = "AirPlay-Windows");
+    // rendering thread. `start_hidden` creates the SDL window hidden; this
+    // is used by the Windows tray/autostart path so the receiver can start
+    // in the background without flashing a window.
+    bool start(const std::string& title = "AirPlay-Windows",
+               bool start_hidden = false);
+
+    // When enabled, a normal window close hides the window instead of
+    // stopping the renderer/process. The tray menu remains the explicit
+    // exit path. Thread-safe and may be changed after start().
+    void set_close_hides(bool enabled) { close_hides_.store(enabled); }
+
+    // Thread-safe window visibility requests used by the native system tray.
+    void show_window();
+    void hide_window();
+    bool window_visible() const { return window_visible_.load(); }
 
     // Tell the thread to exit, join it, tear down SDL.
     void stop();
@@ -180,10 +194,15 @@ public:
     bool user_closed() const { return closed_.load(); }
 
 private:
-    void run(const std::string& title);
+    void run(const std::string& title, bool start_hidden);
 
     std::atomic<bool> running_{false};
     std::atomic<bool> closed_{false};
+    std::atomic<bool> close_hides_{false};
+    std::atomic<bool> window_visible_{false};
+    // 0 = none, +1 = show, -1 = hide. Consumed by the render thread so all
+    // SDL window operations stay on the thread that owns the SDL window.
+    std::atomic<int>  visibility_request_{0};
     std::thread       thread_;
 
     // Single-slot frame buffer (producer overwrites, consumer reads).
@@ -294,6 +313,11 @@ private:
     // MP4 writer. Encoding runs on its own bounded worker queue so recording
     // cannot add latency to mirror decode/render.
     std::unique_ptr<VideoRecorder> recorder_;
+
+    // Windows SMTC publisher. The implementation is a no-op on non-Windows
+    // builds; on Windows it exposes the active AirPlay session to the OS so
+    // HASS.Agent and the system media flyout can see metadata/playback state.
+    std::unique_ptr<ap::platform::WindowsMediaSession> media_session_;
 };
 
 } // namespace ap::video

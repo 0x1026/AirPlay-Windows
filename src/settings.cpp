@@ -12,6 +12,39 @@
 
 namespace ap {
 
+// RAOP adds 12 MAC hex digits and '@' to the same DNS label (63 bytes).
+// Dots and backslashes are excluded because the native Windows backend
+// constructs a dotted DNS name directly, without escaping label contents.
+bool valid_receiver_name(const std::string& name) {
+    if (name.empty() || name.size() > 50 ||
+        name.front() == ' ' || name.back() == ' ') return false;
+    for (std::size_t i = 0; i < name.size();) {
+        const auto c = static_cast<unsigned char>(name[i++]);
+        if (c < 0x80) {
+            if (c < 0x20 || c == 0x7f || c == '.' || c == '\\') return false;
+            continue;
+        }
+        // Strict UTF-8: reject overlong encodings, surrogates and > U+10FFFF.
+        unsigned int cp = 0;
+        unsigned int min = 0;
+        unsigned int remaining = 0;
+        if (c >= 0xc2 && c <= 0xdf) { cp = c & 0x1f; min = 0x80; remaining = 1; }
+        else if (c >= 0xe0 && c <= 0xef) { cp = c & 0x0f; min = 0x800; remaining = 2; }
+        else if (c >= 0xf0 && c <= 0xf4) { cp = c & 0x07; min = 0x10000; remaining = 3; }
+        else return false;
+        if (i + remaining > name.size()) return false;
+        while (remaining--) {
+            const auto next = static_cast<unsigned char>(name[i++]);
+            if ((next & 0xc0) != 0x80) return false;
+            cp = (cp << 6) | (next & 0x3f);
+        }
+        if (cp < min || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff) ||
+            (cp >= 0x80 && cp <= 0x9f)) return false;
+    }
+    return true;
+}
+
+
 std::filesystem::path settings_path() {
 #if defined(_WIN32)
     PWSTR wide_path = nullptr;
@@ -36,7 +69,13 @@ PersistentSettings load_settings() {
     if (!in.is_open()) return s;
 
     std::string line;
+    bool first_line = true;
     while (std::getline(in, line)) {
+        // Accept UTF-8 BOMs from Windows editors and either line ending.
+        if (first_line &&
+            line.compare(0, 3, "\xef\xbb\xbf") == 0) line.erase(0, 3);
+        first_line = false;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         if (line.empty() || line[0] == '#') continue;
         auto eq = line.find('=');
         if (eq == std::string::npos) continue;
@@ -45,7 +84,11 @@ PersistentSettings load_settings() {
         std::string val = line.substr(eq + 1);
 
         try {
-            if      (key == "mirror_width") {
+            if (key == "receiver_name") {
+                if (valid_receiver_name(val)) s.receiver_name = val;
+                else LOG_WARN << "settings: invalid receiver_name, keeping default";
+            }
+            else if (key == "mirror_width") {
                 const int n = std::stoi(val);
                 if (n >= 320 && n <= 7680) s.mirror_width = n;
             }
@@ -91,7 +134,9 @@ void save_settings(const PersistentSettings& s) {
         return;
     }
 
-    out << "mirror_width="   << s.mirror_width   << '\n'
+    out << "receiver_name=" << (valid_receiver_name(s.receiver_name)
+                                  ? s.receiver_name : default_receiver_name) << '\n'
+        << "mirror_width="   << s.mirror_width   << '\n'
         << "mirror_height="  << s.mirror_height  << '\n'
         << "hevc_enabled="   << s.hevc_enabled   << '\n'
         << "max_fps="        << s.max_fps        << '\n'

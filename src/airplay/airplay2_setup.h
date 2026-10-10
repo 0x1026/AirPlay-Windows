@@ -72,9 +72,9 @@ public:
     Airplay2SetupResponse();
     ~Airplay2SetupResponse();
 
-    // Session branch. eventPort is ALWAYS 0 in mirror/audio mode per UxPlay;
-    // only timingPort carries a real bound value.
-    void add_session(uint16_t timing_lport);
+    // Session branch. eventPort is the receiver's TCP event listener;
+    // timingPort is the receiver's UDP NTP timing socket.
+    void add_session(uint16_t event_lport, uint16_t timing_lport);
 
     // Stream branch. `requests` and `allocated` must be the same size.
     void add_streams(const std::vector<StreamRequest>& requests,

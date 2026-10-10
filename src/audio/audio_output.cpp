@@ -26,9 +26,7 @@ bool SdlAudioOutput::start(int sample_rate, int channels) {
     want.callback = nullptr;          // push mode via SDL_QueueAudio
 
     SDL_AudioSpec got{};
-    device_ = SDL_OpenAudioDevice(nullptr, 0, &want, &got,
-                                  SDL_AUDIO_ALLOW_FREQUENCY_CHANGE
-                                | SDL_AUDIO_ALLOW_CHANNELS_CHANGE);
+    device_ = SDL_OpenAudioDevice(nullptr, 0, &want, &got, 0);
     if (device_ == 0) {
         LOG_ERROR << "SDL_OpenAudioDevice failed: " << SDL_GetError();
         SDL_QuitSubSystem(SDL_INIT_AUDIO);
@@ -50,12 +48,9 @@ void SdlAudioOutput::stop() {
         SDL_CloseAudioDevice(device_);
         device_ = 0;
         // Deliberately NOT calling SDL_QuitSubSystem(SDL_INIT_AUDIO):
-        // stop() runs on the RTSP server thread during session
-        // teardown, and on Windows shutting down the SDL audio
-        // subsystem cross-thread can knock out the video event pump
-        // (spontaneous SDL_QUIT / window close). SDL_Quit() in the
-        // renderer's shutdown path will clean up the subsystem when
-        // the app actually exits.
+        // stop() may run on an AirPlay/RTSP worker thread. main() performs
+        // the final global SDL_Quit() only after all AirPlay sessions and
+        // the VideoRenderer have stopped.
     }
 }
 

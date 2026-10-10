@@ -140,12 +140,12 @@ Airplay2SetupResponse::Airplay2SetupResponse()
     : impl_(std::make_unique<Impl>()) {}
 Airplay2SetupResponse::~Airplay2SetupResponse() = default;
 
-void Airplay2SetupResponse::add_session(uint16_t timing_lport) {
-    // eventPort is ALWAYS 0 in mirror/audio mode per UxPlay — only timingPort
-    // carries a real bound value.
-    set_uint(impl_->root, "eventPort",  0);
+void Airplay2SetupResponse::add_session(uint16_t event_lport,
+                                        uint16_t timing_lport) {
+    set_uint(impl_->root, "eventPort",  event_lport);
     set_uint(impl_->root, "timingPort", timing_lport);
-    LOG_INFO << "airplay2 SETUP response: eventPort=0  timingPort=" << timing_lport;
+    LOG_INFO << "airplay2 SETUP response: eventPort=" << event_lport
+             << " timingPort=" << timing_lport;
 }
 
 void Airplay2SetupResponse::add_streams(

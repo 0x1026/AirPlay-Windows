@@ -131,6 +131,30 @@ Then on iPhone / iPad / Mac on the same Wi-Fi: Control Center ->
 Screen Mirroring -> `AirPlay-Windows`. On tap, the logs show the
 full handshake + the H.264 stream coming in.
 
+### Receiver name
+
+```powershell
+build\Release\airplay-windows.exe --name "hugoo-computer"
+```
+
+`--name NAME` (or `--name=NAME`) sets the name used by AirPlay, RAOP,
+`/info` and the idle screen. Priority: CLI > saved `receiver_name` >
+`AirPlay-Windows`. Existing settings files without that key keep the original
+name. The effective name is saved with the other settings on normal exit
+(close the window or press Ctrl-C); a forced termination does not save it.
+
+On Windows you can also edit `receiver_name=hugoo-computer` in
+`%APPDATA%\AirPlay-Windows\settings.ini` while the app is closed. Save the
+file as UTF-8 and restart the app. To reset, launch with
+`--name "AirPlay-Windows"` and close normally, or remove the key while closed.
+Settings persistence remains Windows-only, as before.
+
+Names support Unicode and internal spaces, and must occupy 1-50 UTF-8 bytes
+(RAOP reserves 13 of the DNS label's 63 bytes for the MAC address and `@`).
+Control characters, dots, backslashes and leading/trailing ASCII spaces are
+rejected. Invalid CLI names exit with code 2; invalid saved names are ignored.
+Use `--help` for command-line help.
+
 ### In-app shortcuts
 
 | Key                | Action                                          |

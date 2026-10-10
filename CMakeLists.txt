@@ -301,6 +301,7 @@ add_executable(airplay-windows
     src/main.cpp
     src/log.cpp
     src/settings.cpp
+    src/platform/windows_media_session.cpp
     src/net/socket.cpp
     src/net/tcp_server.cpp
     src/mdns/mdns_service.cpp
@@ -309,6 +310,7 @@ add_executable(airplay-windows
     src/crypto/fairplay.cpp
     src/crypto/mirror_decrypt.cpp
     src/airplay/airplay2_setup.cpp
+    src/airplay/event_channel.cpp
     src/airplay/daap.cpp
     src/airplay/h264_nal.cpp
     src/airplay/h264_sps.cpp
@@ -413,7 +415,7 @@ if(WIN32)
     # VideoRenderer window.
     target_link_libraries(airplay-windows PRIVATE
         ws2_32 iphlpapi dnsapi dwmapi
-        setupapi shell32 ole32)   # USB enumeration + Lockdown directory lookup
+        setupapi shell32 ole32 windowsapp)   # USB + WinRT SMTC
 
     # Released as a GUI app so no empty console window pops up when
     # launched from File Explorer. main() stays the entry point — the
