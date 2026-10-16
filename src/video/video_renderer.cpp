@@ -1,5 +1,6 @@
 #include "video/video_renderer.h"
 #include "video/video_recorder.h"
+#include "video/gpu_video.h"
 #include "airplay/live_settings.h"
 #include "log.h"
 
@@ -411,7 +412,18 @@ SDL_Rect fit_inside(int src_w, int src_h, int win_w, int win_h) {
 } // namespace
 
 VideoRenderer::VideoRenderer() : recorder_(std::make_unique<VideoRecorder>()) {}
-VideoRenderer::~VideoRenderer() { stop(); }
+VideoRenderer::~VideoRenderer() {
+    stop();
+    av_buffer_unref(&gpu_device_);
+}
+
+AVBufferRef* VideoRenderer::gpu_device_ref() {
+    std::unique_lock<std::mutex> lock(mtx_);
+    cv_.wait_for(lock, std::chrono::seconds(5), [this] {
+        return gpu_ready_ || !running_.load();
+    });
+    return running_.load() && gpu_device_ ? av_buffer_ref(gpu_device_) : nullptr;
+}
 
 bool VideoRenderer::start(const std::string& title) {
     running_ = true;
@@ -765,6 +777,9 @@ void VideoRenderer::run(const std::string& title) {
         : true;
     Uint32 renderer_flags = SDL_RENDERER_ACCELERATED;
     if (vsync_initial) renderer_flags |= SDL_RENDERER_PRESENTVSYNC;
+#if defined(_WIN32)
+    SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
+#endif
     SDL_Renderer* renderer = window
         ? SDL_CreateRenderer(window, -1, renderer_flags)
         : nullptr;
@@ -779,6 +794,16 @@ void VideoRenderer::run(const std::string& title) {
     }
     LOG_INFO << "VideoRenderer window up (" << kDefaultWinWidth
              << 'x' << kDefaultWinHeight << ", resizable)";
+
+    GpuVideo gpu_video;
+    gpu_video.init(renderer);
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        av_buffer_unref(&gpu_device_);
+        gpu_device_ = gpu_video.device_ref();
+        gpu_ready_ = true;
+        cv_.notify_all();
+    }
 
     // Win11 Mica backdrop. No-op on pre-Win11 — caller sees a regular
     // opaque window chrome instead of the subtle acrylic blur.
@@ -907,6 +932,19 @@ void VideoRenderer::run(const std::string& title) {
     int  saved_window_h     = 0;
     bool ignore_next_resize = false;
 
+    // iOS sends upright frames with updated dimensions when it rotates.
+    // Auto must not apply another 90 degrees to an already upright image.
+    auto rotation_degrees = [&]() {
+        const int mode = live_settings_ ? live_settings_->video_rotation.load() : -1;
+        return mode >= 0 && mode <= 3 ? mode * 90 : 0;
+    };
+    auto display_width = [&]() {
+        return rotation_degrees() % 180 ? video_tex_h : video_tex_w;
+    };
+    auto display_height = [&]() {
+        return rotation_degrees() % 180 ? video_tex_w : video_tex_h;
+    };
+
     // "Shrink to fit" snap: collapse the dimension that exceeds the
     // target aspect, leave the other one alone. Used on chromeless
     // entry (so the new window fits inside the previous chrome
@@ -918,7 +956,7 @@ void VideoRenderer::run(const std::string& title) {
         int wnow = 0, hnow = 0;
         SDL_GetWindowSize(window, &wnow, &hnow);
         if (wnow <= 0 || hnow <= 0) return;
-        const float vid_a = float(video_tex_w) / float(video_tex_h);
+        const float vid_a = float(display_width()) / float(display_height());
         const float win_a = float(wnow) / float(hnow);
         int snap_w = wnow, snap_h = hnow;
         if (win_a > vid_a) {
@@ -945,7 +983,7 @@ void VideoRenderer::run(const std::string& title) {
         int wnow = 0, hnow = 0;
         SDL_GetWindowSize(window, &wnow, &hnow);
         if (wnow <= 0 || hnow <= 0) return;
-        const float vid_a = float(video_tex_w) / float(video_tex_h);
+        const float vid_a = float(display_width()) / float(display_height());
         const int long_dim = std::max(wnow, hnow);
         int new_w, new_h;
         if (vid_a >= 1.0f) {        // landscape video
@@ -984,7 +1022,7 @@ void VideoRenderer::run(const std::string& title) {
         // window the size of the video, which crushes the layout.
         const bool video_changed =
             ui.chromeless &&
-            (video_tex_w != prev_video_w || video_tex_h != prev_video_h);
+            (display_width() != prev_video_w || display_height() != prev_video_h);
         if (ui.chromeless != prev_chromeless) {
             if (ui.chromeless && !fullscreen) {
                 SDL_GetWindowSize(window,
@@ -999,15 +1037,15 @@ void VideoRenderer::run(const std::string& title) {
             prev_chromeless = ui.chromeless;
             if (live_settings_)
                 live_settings_->chromeless.store(ui.chromeless, std::memory_order_relaxed);
-            prev_video_w    = video_tex_w;
-            prev_video_h    = video_tex_h;
+            prev_video_w    = display_width();
+            prev_video_h    = display_height();
         } else if (video_changed) {
             // iPhone rotation flips portrait <-> landscape: use the
             // area-preserving snap so the window swaps dims rather
             // than shrinking by half each rotation.
             snap_preserving_area();
-            prev_video_w = video_tex_w;
-            prev_video_h = video_tex_h;
+            prev_video_w = display_width();
+            prev_video_h = display_height();
         }
 
         // Honor live VSYNC toggle: SDL 2.0.18+ supports flipping
@@ -1128,7 +1166,9 @@ void VideoRenderer::run(const std::string& title) {
         Uint32 desired_fmt = SDL_PIXELFORMAT_IYUV;
         AVFrame* af = avf_local.frame;
         if (have_avf && af) {
-            if (af->format == AV_PIX_FMT_NV12) {
+            if (af->format == AV_PIX_FMT_D3D11) {
+                desired_fmt = SDL_PIXELFORMAT_ARGB8888;
+            } else if (af->format == AV_PIX_FMT_NV12) {
                 desired_fmt = SDL_PIXELFORMAT_NV12;
             } else {
                 desired_fmt = SDL_PIXELFORMAT_IYUV;
@@ -1141,15 +1181,18 @@ void VideoRenderer::run(const std::string& title) {
         if (have_avf || have_frame) {
             if (!video_tex || video_tex_w != w || video_tex_h != h ||
                 video_tex_fmt != desired_fmt) {
+                gpu_video.reset_target();
                 if (video_tex) SDL_DestroyTexture(video_tex);
                 video_tex = SDL_CreateTexture(renderer,
-                    desired_fmt, SDL_TEXTUREACCESS_STREAMING, w, h);
+                    desired_fmt, desired_fmt == SDL_PIXELFORMAT_ARGB8888
+                        ? SDL_TEXTUREACCESS_TARGET : SDL_TEXTUREACCESS_STREAMING, w, h);
                 video_tex_w   = w;
                 video_tex_h   = h;
                 video_tex_fmt = desired_fmt;
                 LOG_INFO << "VideoRenderer texture ("
                          << (desired_fmt == SDL_PIXELFORMAT_NV12 ? "NV12"
-                                                                 : "IYUV")
+                             : desired_fmt == SDL_PIXELFORMAT_ARGB8888 ? "GPU BGRA"
+                                                                     : "IYUV")
                          << ") created " << w << 'x' << h;
             }
             if (video_tex) {
@@ -1157,7 +1200,14 @@ void VideoRenderer::run(const std::string& title) {
                     // Direct upload from the refcounted AVFrame —
                     // the planes never crossed our buffers, just
                     // the FFmpeg pool → SDL staging texture.
-                    if (af->format == AV_PIX_FMT_NV12) {
+                    if (af->format == AV_PIX_FMT_D3D11) {
+                        if (!gpu_video.convert(renderer, video_tex, af)) {
+                            LOG_ERROR << "D3D11 surface conversion failed";
+                            gpu_video.reset_target();
+                            SDL_DestroyTexture(video_tex);
+                            video_tex = nullptr;
+                        }
+                    } else if (af->format == AV_PIX_FMT_NV12) {
                         SDL_UpdateNVTexture(video_tex, nullptr,
                             af->data[0], af->linesize[0],
                             af->data[1], af->linesize[1]);
@@ -1357,8 +1407,19 @@ void VideoRenderer::run(const std::string& title) {
             (!has_active_dev || active_dev.kind != "Mirror");
 
         if (show_video) {
-            SDL_Rect dst = fit_inside(video_tex_w, video_tex_h, win_w, win_h);
-            SDL_RenderCopy(renderer, video_tex, nullptr, &dst);
+            const int angle = rotation_degrees();
+            SDL_Rect dst = fit_inside(display_width(), display_height(), win_w, win_h);
+            // SDL rotates the destination rectangle around its centre. Swap
+            // its unrotated extents so the final bounds fit the stage exactly.
+            SDL_Rect copy_dst = dst;
+            if (angle % 180) {
+                copy_dst.w = dst.h;
+                copy_dst.h = dst.w;
+                copy_dst.x = dst.x + (dst.w - copy_dst.w) / 2;
+                copy_dst.y = dst.y + (dst.h - copy_dst.h) / 2;
+            }
+            SDL_RenderCopyEx(renderer, video_tex, nullptr, &copy_dst,
+                             angle, nullptr, SDL_FLIP_NONE);
             if (show_pause_badge) {
                 draw_pause_badge(dst);
             }
@@ -1523,7 +1584,7 @@ void VideoRenderer::run(const std::string& title) {
                 const char* primary_tb =
                     !active_dev.name.empty()    ? active_dev.name.c_str()
                   : !active_dev.peer_ip.empty() ? active_dev.peer_ip.c_str()
-                  : "iPhone";
+                  : "Device";
                 ImGui::Text("%s - %s", active_dev.kind.c_str(), primary_tb);
             } else {
                 ImGui::TextDisabled("Idle - waiting for AirPlay");
@@ -1552,7 +1613,7 @@ void VideoRenderer::run(const std::string& title) {
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip(
                         "Drop the current AirPlay session "
-                        "(iPhone may re-mirror immediately)");
+                        "(device may re-mirror immediately)");
                 }
                 ImGui::SameLine();
             }
@@ -1622,7 +1683,7 @@ void VideoRenderer::run(const std::string& title) {
                 const char* primary =
                     !active_dev.name.empty() ? active_dev.name.c_str()
                   : !active_dev.peer_ip.empty() ? active_dev.peer_ip.c_str()
-                  : "iPhone";
+                  : "Device";
                 ImGui::TextUnformatted(primary);
                 ImGui::TextDisabled("  %s", active_dev.kind.c_str());
                 if (!active_dev.name.empty() && !active_dev.peer_ip.empty()) {
@@ -1647,7 +1708,7 @@ void VideoRenderer::run(const std::string& title) {
                 ImGui::TextDisabled("No device connected");
                 ImGui::Spacing();
                 ImGui::TextDisabled(
-                    "Open AirPlay on iOS and pick this "
+                    "Open AirPlay on your device and pick this "
                     "receiver to start mirroring.");
             }
             ImGui::PopTextWrapPos();
@@ -1671,6 +1732,29 @@ void VideoRenderer::run(const std::string& title) {
                 // hint strings (VSYNC / GPU decoder explanations, etc.)
                 // stay inside the panel instead of running off-screen.
                 ImGui::PushTextWrapPos(0.0f);
+                if (ImGui::CollapsingHeader("Rotation",
+                        ImGuiTreeNodeFlags_DefaultOpen)) {
+                    if (live_settings_) {
+                        const char* modes[] = {
+                            "Automatic (device)", "Manual: 0 degrees",
+                            "Manual: 90 degrees", "Manual: 180 degrees",
+                            "Manual: 270 degrees"
+                        };
+                        int selected = live_settings_->video_rotation.load() + 1;
+                        ImGui::SetNextItemWidth(-1.0f);
+                        if (ImGui::Combo("##video_rotation", &selected, modes, 5))
+                            live_settings_->video_rotation.store(selected - 1);
+                        ImGui::TextDisabled(
+                            "Auto follows the orientation sent by the device."
+                            " Manual angles rotate clockwise from the received image.");
+                        if (video_tex_w > 0 && video_tex_h > 0)
+                            ImGui::TextDisabled("Received: %s (%d x %d)",
+                                video_tex_w > video_tex_h ? "Landscape" :
+                                video_tex_w < video_tex_h ? "Portrait" : "Square",
+                                video_tex_w, video_tex_h);
+                        ImGui::TextDisabled("Applies live to display only; recording is unchanged.");
+                    }
+                }
                 if (ImGui::CollapsingHeader("Mirror Resolution",
                         ImGuiTreeNodeFlags_DefaultOpen)) {
                     if (live_settings_) {
@@ -1678,7 +1762,10 @@ void VideoRenderer::run(const std::string& title) {
                         static const Preset presets[] = {
                             {"1920x1080  (Full HD)",      1920, 1080},
                             {"2560x1440  (QHD, default)", 2560, 1440},
-                            {"2868x2868  (iPhone native)",2868, 2868},
+                            {"1920x1920  (square limit)",1920, 1920},
+                            {"2560x2560  (square limit)",2560, 2560},
+                            {"2868x2868  (square limit)",2868, 2868},
+                            {"3840x3840  (square limit)",3840, 3840},
                             {"3840x2160  (4K UHD)",       3840, 2160},
                         };
                         int cur_w = live_settings_->mirror_width.load();
@@ -1763,7 +1850,13 @@ void VideoRenderer::run(const std::string& title) {
                             ImGui::TextDisabled(
                                 "Range: 320-7680 x 240-4320");
                         }
-                        ImGui::TextDisabled("Applies on next iPhone connection");
+                        ImGui::TextDisabled(
+                            "Maximum stream dimensions, not device native resolution."
+                            " The device chooses the actual resolution and aspect ratio."
+                            " Square limits allow room for portrait and landscape.");
+                        if (video_tex_w > 0 && video_tex_h > 0)
+                            ImGui::TextDisabled("Received: %d x %d", video_tex_w, video_tex_h);
+                        ImGui::TextDisabled("Applies on next device connection");
                     } else {
                         ImGui::TextDisabled("(LiveSettings not wired)");
                     }
@@ -1785,7 +1878,7 @@ void VideoRenderer::run(const std::string& title) {
                         ImGui::TextDisabled(
                             "iOS caps mirror at 60 fps regardless of hint;"
                             " lower values force a deterministic cadence.");
-                        ImGui::TextDisabled("Applies on next iPhone connection");
+                        ImGui::TextDisabled("Applies on next device connection");
                     } else {
                         ImGui::TextDisabled("(LiveSettings not wired)");
                     }
@@ -1799,9 +1892,9 @@ void VideoRenderer::run(const std::string& title) {
                         }
                         ImGui::TextDisabled(
                             hevc
-                              ? "iOS may pick HEVC at high resolution"
+                              ? "The device may pick HEVC at high resolution"
                               : "Force H.264 (more CPU, more bandwidth)");
-                        ImGui::TextDisabled("Applies on next iPhone connection");
+                        ImGui::TextDisabled("Applies on next device connection");
                     } else {
                         ImGui::TextDisabled("(LiveSettings not wired)");
                     }
@@ -1810,17 +1903,16 @@ void VideoRenderer::run(const std::string& title) {
                         ImGuiTreeNodeFlags_DefaultOpen)) {
                     if (live_settings_) {
                         bool hw = live_settings_->mirror_hwaccel.load();
-                        if (ImGui::Checkbox("GPU decode (cuvid / D3D11VA)",
+                        if (ImGui::Checkbox("GPU decode (D3D11, no CPU readback)",
                                             &hw)) {
                             live_settings_->mirror_hwaccel.store(hw);
                         }
                         ImGui::TextDisabled(
                             hw
-                              ? "GPU pipeline: NVDEC cuvid (NVIDIA) ->"
-                                " D3D11VA fallback."
-                              : "Software libavcodec - fastest end-to-end"
-                                " latency on single-stream mirror.");
-                        ImGui::TextDisabled("Applies on next iPhone connection");
+                              ? "D3D11 decode and color conversion stay on the GPU."
+                                " Software fallback if unavailable."
+                              : "Software libavcodec decode; GPU display.");
+                        ImGui::TextDisabled("Applies on next device connection");
 
                         ImGui::Separator();
 
@@ -2087,6 +2179,7 @@ void VideoRenderer::run(const std::string& title) {
     if (idle_name_tex) SDL_DestroyTexture(idle_name_tex);
     if (idle_ip_tex)   SDL_DestroyTexture(idle_ip_tex);
     if (idle_msg_tex)  SDL_DestroyTexture(idle_msg_tex);
+    gpu_video.reset_target();
     if (video_tex)     SDL_DestroyTexture(video_tex);
     if (cover_tex)     SDL_DestroyTexture(cover_tex);
     for (TTF_Font* f : fonts_big)   if (f) TTF_CloseFont(f);

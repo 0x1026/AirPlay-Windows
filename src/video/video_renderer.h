@@ -13,6 +13,7 @@
 
 extern "C" {
 struct AVFrame;
+struct AVBufferRef;
 }
 
 namespace ap::airplay { struct LiveSettings; }
@@ -96,6 +97,9 @@ public:
     // (latest-wins) so no backlog accumulates if the GPU is slow.
     // Thread-safe.
     void push_avframe(const AVFrame* src, int64_t origin_ns = 0);
+
+    // Caller owns the returned FFmpeg ref. Null when D3D11 is unavailable.
+    AVBufferRef* gpu_device_ref();
 
     // Decoded RAOP PCM, forwarded to the active MP4 recorder before SDL
     // playback. sample_count is the total number of interleaved int16 values.
@@ -192,6 +196,8 @@ private:
     //   NV12  → y_buf_, uv_buf_         (2 planes, interleaved UV)
     std::mutex                 mtx_;
     std::condition_variable    cv_;
+    AVBufferRef*              gpu_device_ = nullptr;
+    bool                      gpu_ready_ = false;
     std::vector<unsigned char> y_buf_;
     std::vector<unsigned char> u_buf_;
     std::vector<unsigned char> v_buf_;

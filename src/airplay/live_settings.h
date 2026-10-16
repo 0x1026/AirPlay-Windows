@@ -35,14 +35,9 @@ struct LiveSettings {
     std::atomic<int>  max_fps{60};
     std::atomic<int>  refresh_rate{60};
 
-    // False → keep the software libavcodec path (default). On
-    // benchmarking with cuvid (NVDEC on RTX 3080) and D3D11VA we
-    // measured ~30-38 ms of local-pipeline latency vs ~12 ms in
-    // software, because the HW path pays two synchronous PCIe
-    // round-trips (av_hwframe_transfer_data + SDL_UpdateNVTexture)
-    // that single-stream mirror doesn't amortise. Software wins
-    // for single-stream low-latency mirror; users who want CPU
-    // offload (multi-stream or weak CPUs) flip this to true.
+    // False: software decoding (default). True: D3D11VA decoding,
+    // GPU color conversion and shared-texture presentation on the
+    // same GPU adapter, without CPU readback for display.
     std::atomic<bool> mirror_hwaccel{false};
 
     // SDL_RENDERER_PRESENTVSYNC. False → present immediately when a
@@ -54,6 +49,9 @@ struct LiveSettings {
 
     std::atomic<bool> fullscreen{false};
     std::atomic<bool> chromeless{false};
+    // Display only: -1 follows the orientation encoded by iOS; 0..3 adds
+    // clockwise quarter turns to the received image. Recording is unchanged.
+    std::atomic<int> video_rotation{-1};
 };
 
 } // namespace ap::airplay

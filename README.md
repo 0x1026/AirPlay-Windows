@@ -1,5 +1,8 @@
 # AirPlay Windows Receiver
 
+Latest release: [v0.3.0](https://github.com/moieric11/AirPlay-Windows/releases/tag/v0.3.0)
+— [release notes](docs/releases/v0.3.0.md).
+
 Native AirPlay 2 receiver (mirror + RAOP audio) for Windows, ported
 from [UxPlay](https://github.com/FDH2/UxPlay) (GPL-3.0). 100 %
 native Windows stack — no Bonjour SDK, no Apple runtime dependency.
@@ -58,6 +61,57 @@ native Windows stack — no Bonjour SDK, no Apple runtime dependency.
 Mirror UxPlay as closely as possible, line by line, validating each
 step against a real iPhone. No improvisation: every file cites its
 UxPlay source and keeps a GPL-3.0 compatible license.
+
+## Display rotation
+
+In **OPTIONS > Rotation**, choose **Automatic (device)** (default) or a manual
+clockwise rotation of **0, 90, 180 or 270 degrees** relative to the received
+image. Changes apply immediately and the choice is saved when the app closes.
+The image keeps its proportions, including in fullscreen and video-only mode.
+
+Automatic mode follows portrait/landscape changes in the video sent by the device;
+it does not read the device's physical orientation sensor. If the device keeps the
+stream in portrait (for example with orientation lock), use manual rotation
+to turn the displayed image. Manual 0 degrees displays the received image
+without an additional rotation. Recordings keep the original stream orientation.
+
+In **OPTIONS > Mirror Resolution**, presets specify the maximum stream dimensions
+advertised to the sending device, not its native screen resolution. The device
+chooses the actual resolution and aspect ratio. Square limits leave room for
+both portrait and landscape on phones and tablets; rectangular presets also
+remain available for wider displays. The panel shows the received resolution
+while streaming. Resolution changes apply on the next device connection.
+
+## GPU decode
+
+The **GPU decode** option uses D3D11VA and keeps decoded images in GPU memory
+through color conversion and display. Decode and SDL rendering use the same GPU
+adapter, sharing textures with GPU fence synchronization. There is no per-frame
+GPU-to-CPU pixel transfer for display. Reconnect the sending device after changing
+this option. Software decoding remains available if the GPU path is unsupported.
+Decoder surface views and render targets are reused between frames. The display
+device's present queue is limited to one frame to reduce queued-image latency.
+
+With GPU decoding and a compatible encoder, **Auto / GPU** MP4 recording uses
+D3D11 surfaces directly. Scaling, color conversion and letterboxing after device
+rotation stay on the GPU; the recorder uses its own surfaces so encoder buffering
+does not hold the decoder's pool. The codec status shows **[GPU resident]**.
+Explicit **GPU** recording never silently downloads GPU-decoded images: if no
+compatible direct encoder exists, it reports an error. **Auto** can fall back to
+a CPU pixel path, and **CPU** recording remains available. Audio encoding and
+writing compressed MP4 packets still run on the CPU.
+The first-frame PPM diagnostic is skipped in GPU mode to avoid a readback.
+
+To run the Windows hardware integration checks, configure with
+`-DBUILD_GPU_TESTS=ON`, build `test-gpu-video` in Release, then run
+`build/Release/test-gpu-video.exe`. The decoding fixtures use NVIDIA NVENC;
+the test checks H.264/HEVC CPU and GPU output, resolution and codec switches,
+GPU texture array slices, full/limited color range and four display rotations.
+It also verifies GPU H.264/HEVC recordings with concurrent display, Auto/CPU modes,
+software-decoded input, zero-readback counters, MP4 decoding, audio and timestamps.
+Pixel upload/readback in this test is validation instrumentation only.
+Pass `--benchmark` to also measure 1080p conversion submission and rendering.
+These local timings do not measure device-to-screen AirPlay latency.
 
 ## Requirements (Windows)
 

@@ -183,13 +183,9 @@ int main(int argc, char** argv) {
                 "                        of bandwidth, common: 1920x1080,\n"
                 "                        2560x1440, 3840x2160)\n"
                 "  --mirror-hwaccel      decode mirror H.264/HEVC on the GPU\n"
-                "                        (NVDEC cuvid -> D3D11VA cascade).\n"
-                "                        Off by default: benchmarks show\n"
-                "                        software libavcodec is faster\n"
-                "                        end-to-end on single-stream mirror\n"
-                "                        because GPU paths pay 2 PCIe trips\n"
-                "                        per frame. Useful for CPU-constrained\n"
-                "                        machines or future multi-stream.");
+                "                        (D3D11VA, GPU-resident presentation).\n"
+                "                        No CPU pixel readback for display.\n"
+                "                        Software fallback if unavailable.");
             ap::net::global_shutdown();
             return 0;
         }
@@ -202,7 +198,7 @@ int main(int argc, char** argv) {
     LOG_INFO << "Mirror display advertised: " << mirror_w << 'x' << mirror_h;
     LOG_INFO << "Mirror decoder default: "
              << (mirror_hwaccel
-                   ? "GPU hwaccel (--mirror-hwaccel; cuvid -> D3D11VA cascade)"
+                   ? "GPU hwaccel (--mirror-hwaccel; D3D11VA resident surfaces)"
                    : "software libavcodec (toggle GPU in OPTIONS panel)");
 
     // Live-mutable settings exposed to the overlay UI. Seed from the
@@ -219,6 +215,7 @@ int main(int argc, char** argv) {
     live_settings.vsync_enabled.store(saved.vsync_enabled);
     live_settings.fullscreen.store(saved.fullscreen);
     live_settings.chromeless.store(saved.chromeless);
+    live_settings.video_rotation.store(saved.video_rotation);
     ctx.live = &live_settings;
     LOG_INFO << "AirPlay Streaming HLS path: "
              << (hls_playback ? "ENABLED (--hls-proxy-playback)"

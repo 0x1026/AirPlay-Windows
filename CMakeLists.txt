@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(airplay-windows VERSION 0.1.0 LANGUAGES C CXX)
+project(airplay-windows VERSION 0.3.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -325,6 +325,8 @@ add_executable(airplay-windows
     src/airplay/reverse_channel.cpp
     src/airplay/routes.cpp
     src/video/h264_decoder.cpp
+    src/video/gpu_video.cpp
+    src/video/gpu_recording.cpp
     src/video/video_recorder.cpp
     ${HLS_PLAYER_SRC}
     src/video/video_renderer.cpp
@@ -412,7 +414,7 @@ if(WIN32)
     # dwmapi: DwmSetWindowAttribute for the Win11 Mica backdrop on the
     # VideoRenderer window.
     target_link_libraries(airplay-windows PRIVATE
-        ws2_32 iphlpapi dnsapi dwmapi
+        ws2_32 iphlpapi dnsapi dwmapi d3d11
         setupapi shell32 ole32)   # USB enumeration + Lockdown directory lookup
 
     # Released as a GUI app so no empty console window pops up when
@@ -425,6 +427,20 @@ if(WIN32)
 endif()
 
 # ---- Runtime DLL deployment (Windows) ----------------------------------------
+option(BUILD_GPU_TESTS "Build the D3D11 hardware integration test" OFF)
+if(WIN32 AND BUILD_GPU_TESTS)
+    add_executable(test-gpu-video tools/test_gpu_video.cpp src/video/gpu_video.cpp
+        src/video/h264_decoder.cpp src/video/gpu_recording.cpp
+        src/video/video_recorder.cpp src/log.cpp)
+    target_include_directories(test-gpu-video PRIVATE src ${FFMPEG_INCLUDE_DIRS_OK})
+    target_compile_definitions(test-gpu-video PRIVATE SDL_MAIN_HANDLED)
+    target_link_libraries(test-gpu-video PRIVATE ${FFMPEG_TARGETS} ${SDL2_TARGET} d3d11)
+    add_custom_command(TARGET test-gpu-video POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            $<TARGET_RUNTIME_DLLS:test-gpu-video> $<TARGET_FILE_DIR:test-gpu-video>
+        COMMAND_EXPAND_LISTS)
+endif()
+
 # Use $<TARGET_RUNTIME_DLLS:airplay-windows> (CMake 3.21+) to copy ONLY
 # the shared libraries the linker actually depends on transitively —
 # pulls SDL2.dll, SDL2_ttf.dll, avcodec-*.dll, libplist-*.dll,

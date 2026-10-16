@@ -61,9 +61,8 @@ struct DeviceContext {
     int                         mirror_height = 1440;
 
     // When true, the H.264/HEVC mirror decoder requests D3D11VA
-    // hardware acceleration on Windows — frames decode on the GPU,
-    // get pulled to system memory, converted to I420, and fed to
-    // the renderer. Software fallback is automatic when the
+    // hardware acceleration on Windows — frames stay on the GPU
+    // through color conversion and display. Software fallback is automatic when the
     // platform / driver can't honor the request.
     bool                        mirror_hwaccel = false;
 
