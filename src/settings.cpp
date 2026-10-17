@@ -109,6 +109,10 @@ PersistentSettings load_settings() {
             else if (key == "vsync_enabled")  s.vsync_enabled  = std::stoi(val) != 0;
             else if (key == "fullscreen")     s.fullscreen     = std::stoi(val) != 0;
             else if (key == "chromeless")     s.chromeless     = std::stoi(val) != 0;
+            else if (key == "video_rotation") {
+                const int n = std::stoi(val);
+                if (n >= -1 && n <= 3) s.video_rotation = n;
+            }
         } catch (...) {
             LOG_WARN << "settings: malformed value for " << key << "=" << val;
         }
@@ -144,7 +148,8 @@ void save_settings(const PersistentSettings& s) {
         << "mirror_hwaccel=" << s.mirror_hwaccel << '\n'
         << "vsync_enabled="  << s.vsync_enabled  << '\n'
         << "fullscreen="     << s.fullscreen     << '\n'
-        << "chromeless="     << s.chromeless     << '\n';
+        << "chromeless="     << s.chromeless     << '\n'
+        << "video_rotation=" << s.video_rotation << '\n';
 
     LOG_INFO << "settings: saved to " << path.u8string();
 }
@@ -160,6 +165,7 @@ PersistentSettings snapshot(const ap::airplay::LiveSettings& live) {
     s.vsync_enabled  = live.vsync_enabled.load(std::memory_order_relaxed);
     s.fullscreen     = live.fullscreen.load(std::memory_order_relaxed);
     s.chromeless     = live.chromeless.load(std::memory_order_relaxed);
+    s.video_rotation = live.video_rotation.load(std::memory_order_relaxed);
     return s;
 }
 

@@ -1,4 +1,5 @@
 #include "video/video_recorder.h"
+#include "video/gpu_recording.h"
 #include "log.h"
 
 #include <algorithm>
@@ -19,6 +20,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/error.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 }
 
@@ -50,7 +52,7 @@ std::string timestamped_filename() {
     return os.str();
 }
 
-AVPixelFormat encoder_pixel_format(const AVCodec* codec) {
+AVPixelFormat encoder_pixel_format(const AVCodec* codec, bool prefer_gpu_frames = false) {
     if (!codec) return AV_PIX_FMT_NONE;
     const AVPixelFormat* formats = nullptr;
 #if LIBAVCODEC_VERSION_MAJOR >= 61
@@ -65,6 +67,10 @@ AVPixelFormat encoder_pixel_format(const AVCodec* codec) {
 #endif
     // A null list means the encoder accepts every pixel format.
     if (!formats) return AV_PIX_FMT_YUV420P;
+    if (prefer_gpu_frames) {
+        for (const AVPixelFormat* p = formats; *p != AV_PIX_FMT_NONE; ++p)
+            if (*p == AV_PIX_FMT_D3D11) return *p;
+    }
     for (const AVPixelFormat* p = formats; *p != AV_PIX_FMT_NONE; ++p) {
         if (*p == AV_PIX_FMT_YUV420P) return AV_PIX_FMT_YUV420P;
     }
@@ -120,6 +126,8 @@ bool VideoRecorder::start(const std::string& directory, Options options) {
         frames_written_.store(0);
         frames_dropped_.store(0);
         audio_samples_written_.store(0);
+        readback_frames_.store(0);
+        gpu_resident_.store(false);
         started_ns_.store(steady_ns());
         accepting_.store(true);
         thread_ = std::thread(&VideoRecorder::thread_fn, this);
@@ -167,7 +175,10 @@ void VideoRecorder::submit(const AVFrame* frame) {
             av_frame_free(&clone);
             return;
         }
-        if (queue_.size() >= kMaxQueuedFrames) {
+        // Hardware surfaces come from the decoder's bounded pool. Keeping
+        // a long recording backlog would exhaust it and stall live playback.
+        const std::size_t queue_limit = frame->hw_frames_ctx ? 2 : kMaxQueuedFrames;
+        if (queue_.size() >= queue_limit) {
             av_frame_free(&queue_.front().frame);
             queue_.pop_front();
             frames_dropped_.fetch_add(1);
@@ -246,6 +257,8 @@ VideoRecorder::Status VideoRecorder::status() const {
     s.frames = frames_written_.load(std::memory_order_relaxed);
     s.dropped = frames_dropped_.load(std::memory_order_relaxed);
     s.audio_samples = audio_samples_written_.load(std::memory_order_relaxed);
+    s.readback_frames = readback_frames_.load(std::memory_order_relaxed);
+    s.gpu_resident = gpu_resident_.load(std::memory_order_relaxed);
     if (s.recording) {
         s.elapsed_ms = std::max<int64_t>(0,
             (steady_ns() - started_ns_.load(std::memory_order_relaxed)) / 1'000'000);
@@ -268,6 +281,8 @@ void VideoRecorder::thread_fn() {
     AVFrame* audio_frame = nullptr;
     AVFrame* last_output = nullptr;
     SwsContext* sws = nullptr;
+    GpuRecording gpu_converter;
+    bool resident_video = false;
     int64_t first_pts = -1;
     int64_t last_pts = -1;
     int64_t audio_next_pts = 0;
@@ -301,6 +316,17 @@ void VideoRecorder::thread_fn() {
             if (wr < 0) return false;
         }
         return true;
+    };
+    auto write_video = [&](int64_t pts_ms) {
+        if (first_pts < 0) first_pts = pts_ms;
+        output->pts = std::max<int64_t>(last_pts + 1, pts_ms - first_pts);
+        last_pts = output->pts;
+        if (!drain(enc, stream, output)) fail("Video encoding/muxing failed");
+        else {
+            frames_written_.fetch_add(1);
+            if (last_output) av_frame_free(&last_output);
+            last_output = av_frame_clone(output);
+        }
     };
 
     while (true) {
@@ -375,17 +401,25 @@ void VideoRecorder::thread_fn() {
             }
             const AVCodec* chosen = nullptr;
             bool chosen_is_gpu = false;
+            const bool gpu_input = input->format == AV_PIX_FMT_D3D11 && input->hw_frames_ctx;
+            const bool gpu_conversion_ready = gpu_input && options.encoder != EncoderMode::Cpu &&
+                gpu_converter.init(input->hw_frames_ctx, out_w, out_h);
             if (!failed) {
                 for (const char* name : candidates) {
                     const AVCodec* codec = avcodec_find_encoder_by_name(name);
-                    const AVPixelFormat pixel_format = encoder_pixel_format(codec);
+                    const AVPixelFormat pixel_format = encoder_pixel_format(codec, gpu_conversion_ready);
                     if (pixel_format == AV_PIX_FMT_NONE) continue;
+                    // Explicit GPU mode must never hide a readback of GPU input.
+                    if (gpu_input && options.encoder == EncoderMode::Gpu &&
+                        pixel_format != AV_PIX_FMT_D3D11) continue;
                     AVCodecContext* trial = avcodec_alloc_context3(codec);
                     if (!trial) continue;
                     trial->codec_id = codec->id;
                     trial->codec_type = AVMEDIA_TYPE_VIDEO;
                     trial->width = out_w; trial->height = out_h;
                     trial->pix_fmt = pixel_format;
+                    if (pixel_format == AV_PIX_FMT_D3D11)
+                        trial->hw_frames_ctx = gpu_converter.frames_ref();
                     trial->time_base = AVRational{1, 1000};
                     trial->framerate = AVRational{60, 1};
                     trial->bit_rate = static_cast<int64_t>(options.bitrate_mbps)
@@ -407,11 +441,15 @@ void VideoRecorder::thread_fn() {
                         std::strcmp(name, "hevc_nvenc") == 0) {
                         av_dict_set(&opts, "preset", "p4", 0);
                         av_dict_set(&opts, "tune", "ll", 0);
+                        av_dict_set(&opts, "zerolatency", "1", 0);
+                        av_dict_set(&opts, "delay", "0", 0);
                     }
                     rc = avcodec_open2(trial, codec, &opts);
                     av_dict_free(&opts);
                     if (rc == 0) {
                         enc = trial;
+                        resident_video = pixel_format == AV_PIX_FMT_D3D11;
+                        gpu_resident_.store(resident_video);
                         chosen = codec;
                         chosen_is_gpu =
                             std::find(gpu_candidates.begin(),
@@ -496,7 +534,7 @@ void VideoRecorder::thread_fn() {
                     output->format = enc->pix_fmt;
                     output->width = enc->width; output->height = enc->height;
                 }
-                if (!output || av_frame_get_buffer(output, 32) < 0)
+                if (!output || (!resident_video && av_frame_get_buffer(output, 32) < 0))
                     fail("Cannot allocate encoder frame");
             }
             if (!failed) {
@@ -516,14 +554,33 @@ void VideoRecorder::thread_fn() {
                 std::lock_guard<std::mutex> lock(mtx_);
                 codec_name_ = chosen && chosen->long_name
                     ? chosen->long_name : (chosen ? chosen->name : "");
-                codec_name_ += chosen_is_gpu ? " [GPU]" : " [CPU]";
+                codec_name_ += resident_video ? " [GPU resident]"
+                    : chosen_is_gpu ? " [GPU encoder, CPU pixels]" : " [CPU]";
                 LOG_INFO << "Recording started: " << path << " ("
                          << codec_name_ << ", " << out_w << 'x' << out_h
                          << ", " << options.bitrate_mbps << " Mbps)";
             }
         }
 
-        if (have_video && !failed && av_frame_make_writable(output) >= 0) {
+        // Download only for an explicitly selected CPU path or Auto fallback.
+        // The resident encode path never calls transfer_data or swscale.
+        if (input && input->hw_frames_ctx && !resident_video && !failed) {
+            AVFrame* downloaded = av_frame_alloc();
+            if (!downloaded || av_hwframe_transfer_data(downloaded, input, 0) < 0) {
+                av_frame_free(&downloaded);
+                fail("GPU recording frame download failed");
+            } else {
+                av_frame_copy_props(downloaded, input);
+                av_frame_free(&input);
+                input = downloaded;
+                readback_frames_.fetch_add(1);
+            }
+        }
+        if (have_video && !failed && resident_video) {
+            if (!gpu_converter.convert(input, output))
+                fail("GPU recording conversion failed; GPU-decoded frames are required");
+            else write_video(item.pts_ms);
+        } else if (have_video && !failed && av_frame_make_writable(output) >= 0) {
             for (int y = 0; y < output->height; ++y)
                 std::memset(output->data[0] + y * output->linesize[0], 16,
                             static_cast<std::size_t>(output->width));
@@ -562,16 +619,7 @@ void VideoRecorder::thread_fn() {
                                   input->height, dst, output->linesize) <= 0) {
                 fail("Pixel conversion failed while recording");
             } else {
-                if (first_pts < 0) first_pts = item.pts_ms;
-                output->pts = std::max<int64_t>(last_pts + 1, item.pts_ms - first_pts);
-                last_pts = output->pts;
-                if (!drain(enc, stream, output))
-                    fail("Video encoding/muxing failed");
-                else {
-                    frames_written_.fetch_add(1);
-                    if (last_output) av_frame_free(&last_output);
-                    last_output = av_frame_clone(output);
-                }
+                write_video(item.pts_ms);
             }
         }
         av_frame_free(&input);
@@ -668,7 +716,6 @@ void VideoRecorder::thread_fn() {
             (steady_ns() - started_ns_.load()) / 1'000'000 -
             std::max<int64_t>(0, first_pts));
         if (last_output && final_pts > last_pts + 1) {
-            av_frame_make_writable(last_output);
             last_output->pts = final_pts;
             drain(enc, stream, last_output);
         }

@@ -47,12 +47,8 @@ struct H264Decoder::Impl {
     bool                 last_is_yuv420 = false;
     uint64_t             frames_out  = 0;
 
-    // Hardware-accelerated decode via D3D11VA on Windows. The decoder
-    // outputs frames whose `data[]` is a GPU texture handle; we run
-    // av_hwframe_transfer_data into `sw_frame` (typically NV12) and
-    // then sws_scale into our own I420 plane buffers so the renderer
-    // path that expects Y / U / V plane pointers keeps working.
-    enum class HwBackend { None, D3D11VA, Cuvid };
+    // D3D11VA outputs resident GPU textures; presentation never downloads them.
+    enum class HwBackend { None, D3D11VA };
 
     // Per-decode scratch buffer for the Annex-B packet that gets
     // fed to libavcodec. Reused across frames; clear() preserves
@@ -63,20 +59,16 @@ struct H264Decoder::Impl {
 
     bool                 hwaccel_requested = false;
     AVBufferRef*         hw_device_d3d11   = nullptr;   // lazy
-    AVBufferRef*         hw_device_cuda    = nullptr;   // lazy
-    AVFrame*             sw_frame          = nullptr;
     AVPixelFormat        hw_pix_fmt        = AV_PIX_FMT_NONE;
     bool                 frame_is_hw       = false;
     HwBackend            backend           = HwBackend::None;
 
     ~Impl() {
         if (sws)              sws_freeContext(sws);
-        if (sw_frame)         av_frame_free(&sw_frame);
         if (frame)            av_frame_free(&frame);
         if (pkt)              av_packet_free(&pkt);
         if (ctx)              avcodec_free_context(&ctx);
         if (hw_device_d3d11)  av_buffer_unref(&hw_device_d3d11);
-        if (hw_device_cuda)   av_buffer_unref(&hw_device_cuda);
     }
 
     // get_format callback — libavcodec asks us which pixel format to
@@ -91,65 +83,11 @@ struct H264Decoder::Impl {
                 if (*p == self->hw_pix_fmt) return *p;
             }
         }
-        return pix_fmts[0];
-    }
-
-    // Try opening a hwaccel backend in cascade order:
-    //   1. cuvid  — NVIDIA NVDEC native (lowest latency on RTX/GTX)
-    //   2. D3D11VA — Microsoft DirectX video API (any vendor)
-    //   3. software fallback
-    // Returns the backend that succeeded along with the codec to use.
-    // The caller owns the device-context lazy lifecycle.
-    HwBackend try_open_hw_backend(AVCodecID id, const AVCodec*& out_codec) {
-        out_codec = nullptr;
-
-        // Stage 1: cuvid
-        const char* cuvid_name = (id == AV_CODEC_ID_HEVC) ? "hevc_cuvid"
-                              : (id == AV_CODEC_ID_H264) ? "h264_cuvid"
-                              : nullptr;
-        if (cuvid_name) {
-            const AVCodec* c = avcodec_find_decoder_by_name(cuvid_name);
-            if (c) {
-                if (!hw_device_cuda) {
-                    int rc = av_hwdevice_ctx_create(
-                        &hw_device_cuda, AV_HWDEVICE_TYPE_CUDA,
-                        nullptr, nullptr, 0);
-                    if (rc < 0) {
-                        char err[AV_ERROR_MAX_STRING_SIZE]{};
-                        av_strerror(rc, err, sizeof(err));
-                        LOG_INFO << "decoder: CUDA hwdevice not available ("
-                                 << err << ") — trying D3D11VA";
-                    }
-                }
-                if (hw_device_cuda) {
-                    out_codec = c;
-                    return HwBackend::Cuvid;
-                }
-            }
+        for (const AVPixelFormat* p = pix_fmts; *p != AV_PIX_FMT_NONE; ++p) {
+            const AVPixFmtDescriptor* desc = av_pix_fmt_desc_get(*p);
+            if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) return *p;
         }
-
-        // Stage 2: D3D11VA (Windows)
-#if defined(_WIN32)
-        if (!hw_device_d3d11) {
-            int rc = av_hwdevice_ctx_create(
-                &hw_device_d3d11, AV_HWDEVICE_TYPE_D3D11VA,
-                nullptr, nullptr, 0);
-            if (rc < 0) {
-                char err[AV_ERROR_MAX_STRING_SIZE]{};
-                av_strerror(rc, err, sizeof(err));
-                LOG_INFO << "decoder: D3D11VA hwdevice not available ("
-                         << err << ") — falling back to software";
-            }
-        }
-        if (hw_device_d3d11) {
-            const AVCodec* c = avcodec_find_decoder(id);
-            if (c) {
-                out_codec = c;
-                return HwBackend::D3D11VA;
-            }
-        }
-#endif
-        return HwBackend::None;
+        return AV_PIX_FMT_NONE;
     }
 
     // Open (or re-open after a codec switch) libavcodec for `id`.
@@ -158,10 +96,10 @@ struct H264Decoder::Impl {
         HwBackend      bk  = HwBackend::None;
         AVBufferRef*   dev = nullptr;
 
-        if (hwaccel_requested) {
-            bk = try_open_hw_backend(id, c);
-            if (bk == HwBackend::Cuvid)   dev = hw_device_cuda;
-            if (bk == HwBackend::D3D11VA) dev = hw_device_d3d11;
+        if (hwaccel_requested && hw_device_d3d11) {
+            c = avcodec_find_decoder(id);
+            bk = HwBackend::D3D11VA;
+            dev = hw_device_d3d11;
         }
         if (!c) c = avcodec_find_decoder(id);
         if (!c) {
@@ -176,19 +114,12 @@ struct H264Decoder::Impl {
         ctx      = avcodec_alloc_context3(c);
         if (!ctx) return false;
 
-        // Wire the chosen HW backend into the codec context. cuvid
-        // doesn't need a get_format callback (always emits CUDA);
-        // D3D11VA does (we pick AV_PIX_FMT_D3D11 from the offered
-        // list).
+        // Use the render pipeline's D3D11 decode device.
         if (bk != HwBackend::None && dev) {
             ctx->hw_device_ctx = av_buffer_ref(dev);
-            if (bk == HwBackend::D3D11VA) {
-                hw_pix_fmt      = AV_PIX_FMT_D3D11;
-                ctx->get_format = &Impl::get_hw_format_cb;
-                ctx->opaque     = this;
-            } else {
-                hw_pix_fmt = AV_PIX_FMT_NONE; // cuvid handles formats
-            }
+            hw_pix_fmt      = AV_PIX_FMT_D3D11;
+            ctx->get_format = &Impl::get_hw_format_cb;
+            ctx->opaque     = this;
         }
         bool hw_enabled = (bk != HwBackend::None);
         backend = bk;
@@ -210,12 +141,7 @@ struct H264Decoder::Impl {
         // Dropped — the LOW_DELAY win was the bigger one anyway.
         ctx->flags  |= AV_CODEC_FLAG_LOW_DELAY;
 
-        // Quiet "Invalid pkt_timebase, passing timestamps as-is"
-        // from hevc_cuvid / h264_cuvid. iOS doesn't carry PTS in
-        // the mirror bitstream and we don't synthesise any, so
-        // the time base is genuinely "raw frame counter". Setting
-        // pkt_timebase to AV_TIME_BASE_Q satisfies the warning
-        // without changing semantics.
+        // Mirror packets do not carry synthesized presentation timestamps.
         ctx->pkt_timebase = AVRational{ 1, AV_TIME_BASE };
 
         // Default libavcodec threading (FF_THREAD_FRAME) decodes
@@ -229,12 +155,10 @@ struct H264Decoder::Impl {
         ctx->thread_type  = FF_THREAD_SLICE;
         ctx->thread_count = 0;   // 0 = auto (one per CPU core)
 
-        // For HW decode: keep the decoder's frame pool as small as
-        // possible. The default lets libavcodec allocate 4-8 extra
-        // hardware frames for parallelism / pipelining, which adds
-        // 4-8 frame intervals of internal buffering (~70-130 ms at
-        // 60 fps). 1 forces serial decode-then-output behaviour.
-        ctx->extra_hw_frames = 1;
+        // Capacity for decoder output, the latest-wins render slot and
+        // the bounded recording worker. Pool capacity does not queue frames
+        // for presentation; insufficient capacity can stall the decoder.
+        ctx->extra_hw_frames = 8;
 
         if (avcodec_open2(ctx, c, nullptr) != 0) {
             LOG_ERROR << "decoder: avcodec_open2 failed for "
@@ -261,7 +185,6 @@ struct H264Decoder::Impl {
             }
         }
         const char* tag =
-            (backend == HwBackend::Cuvid)   ? "[NVDEC cuvid]" :
             (backend == HwBackend::D3D11VA) ? "[D3D11VA]"     :
                                               "[software]";
         const char* tt =
@@ -283,12 +206,14 @@ struct H264Decoder::Impl {
 H264Decoder::H264Decoder()  : impl_(std::make_unique<Impl>()) {}
 H264Decoder::~H264Decoder() = default;
 
-bool H264Decoder::init(bool hwaccel) {
+bool H264Decoder::init(bool hwaccel, AVBufferRef* render_device) {
     impl_->pkt = av_packet_alloc();
     impl_->frame = av_frame_alloc();
-    impl_->sw_frame = av_frame_alloc();
-    if (!impl_->pkt || !impl_->frame || !impl_->sw_frame) return false;
-    impl_->hwaccel_requested = hwaccel;
+    if (!impl_->pkt || !impl_->frame) return false;
+    // Direct rendering requires the GPU pipeline's D3D11 decode device.
+    impl_->hwaccel_requested = hwaccel && render_device;
+    if (impl_->hwaccel_requested)
+        impl_->hw_device_d3d11 = av_buffer_ref(render_device);
     return impl_->open(AV_CODEC_ID_H264);
 }
 
@@ -444,26 +369,10 @@ bool H264Decoder::set_parameter_sets_from_avcc(const uint8_t* blob,
         return false;
     }
 
-    // cuvid (NVDEC) binds its CUDA context to the SPS at create
-    // time and won't tolerate an in-stream resolution change —
-    // when iPhone rotates portrait↔landscape the new SPS has new
-    // dimensions and cuvidDecodePicture fails with
-    // CUDA_ERROR_INVALID_HANDLE. Force a full reopen on every
-    // SPS change for the cuvid backend; software / D3D11VA
-    // re-init internally and don't need this.
-    auto reopen_for_sps_change = [&](AVCodecID id,
-                                     const std::vector<uint8_t>& sps_new)
-            -> bool {
-        const bool codec_changed = (impl_->codec_id != id);
-        const bool sps_changed   = (impl_->sps_annexb != sps_new);
-        const bool cuvid_needs_reset =
-            (impl_->backend == Impl::HwBackend::Cuvid) && sps_changed;
-        if (codec_changed || cuvid_needs_reset) {
-            return impl_->open(id);
-        }
-        return true;
+    // D3D11VA and software handle in-stream SPS changes internally.
+    auto reopen_for_sps_change = [&](AVCodecID id, const std::vector<uint8_t>&) {
+        return impl_->codec_id == id || impl_->open(id);
     };
-
     // Try H.264 avcC first (common path).
     std::vector<uint8_t> new_sps, new_pps;
     if (parse_avcc(cfg, csz, new_sps, new_pps)) {
@@ -559,41 +468,20 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
     height  = impl_->frame->height;
     impl_->last_w = width;
     impl_->last_h = height;
-    // Any HW backend (cuvid → CUDA, D3D11VA → D3D11) tags the frame
-    // with a hw_frames_ctx; software path leaves it null. This is
-    // the cleanest backend-agnostic detection.
+    // Hardware output carries a frame-pool reference; software output does not.
     impl_->frame_is_hw = (impl_->frame->hw_frames_ctx != nullptr);
 
-    // If the decoder produced a GPU frame, pull it down to system
-    // memory. The transferred frame is typically NV12 (8-bit) — we
-    // expose it as-is (no sws NV12→I420 conversion) so the renderer
-    // can SDL_UpdateNVTexture directly and let SDL's GPU shader do
-    // the YUV→RGB. Saves a per-frame CPU pass at 4K.
-    if (impl_->frame_is_hw) {
-        av_frame_unref(impl_->sw_frame);
-        const int rc = av_hwframe_transfer_data(impl_->sw_frame,
-                                                impl_->frame, 0);
-        if (rc < 0) {
-            char err[AV_ERROR_MAX_STRING_SIZE]{};
-            av_strerror(rc, err, sizeof(err));
-            LOG_WARN << "H264Decoder: hwframe_transfer_data failed " << err;
-            return false;
-        }
-        // The transferred sw_frame is the source of truth for HW
-        // decode; expose its NV12 planes via last_frame_nv12().
-        impl_->last_is_yuv420 = false;
-    } else {
-        impl_->last_is_yuv420 =
-            (impl_->frame->format == AV_PIX_FMT_YUV420P ||
-             impl_->frame->format == AV_PIX_FMT_YUVJ420P);
-    }
-
+    // GPU surfaces stay resident until presentation. Pixel planes are only
+    // accessed for software output; no staging texture or CPU readback.
+    impl_->last_is_yuv420 = !impl_->frame_is_hw &&
+        (impl_->frame->format == AV_PIX_FMT_YUV420P ||
+         impl_->frame->format == AV_PIX_FMT_YUVJ420P);
     // The YUV→RGB conversion (used only for dump_last_frame_ppm)
     // moved out of the per-frame hot path — it cost ~2-5 ms per
     // frame at 4K and was always overhead since dump_last_frame_ppm
     // is invoked only on the very first decoded frame. The sws
     // pass now lives inside dump_last_frame_ppm() itself, run on
-    // demand against the still-alive impl_->frame / impl_->sw_frame.
+    // demand against the still-alive software frame.
 
     ++impl_->frames_out;
     got_frame = true;
@@ -602,14 +490,11 @@ bool H264Decoder::decode(const uint8_t* nal_data, std::size_t nal_size,
 
 bool H264Decoder::dump_last_frame_ppm(const std::string& path) {
     if (!impl_ || impl_->last_w == 0) return false;
+    // Diagnostic dumps must not force readback on the live GPU path.
+    if (impl_->frame_is_hw && impl_->frame->format == AV_PIX_FMT_D3D11) return false;
 
-    // Lazily run YUV→RGB only when dump is actually requested. The
-    // source is the system-memory frame: software decode keeps it
-    // in impl_->frame; HW decode (cuvid / D3D11VA) put it in
-    // impl_->sw_frame after av_hwframe_transfer_data. Feeding the
-    // raw GPU AVFrame to swscale would crash with
-    // "d3d11 is not supported as input pixel format".
-    AVFrame* rgb_src = impl_->frame_is_hw ? impl_->sw_frame : impl_->frame;
+    // Diagnostic conversion is only available for software output.
+    AVFrame* rgb_src = impl_->frame;
     if (!rgb_src || rgb_src->width <= 0 || rgb_src->height <= 0) return false;
 
     AVPixelFormat src_fmt = static_cast<AVPixelFormat>(rgb_src->format);
@@ -660,8 +545,7 @@ bool H264Decoder::last_frame_yuv(const uint8_t*& y, int& y_stride,
                                  const uint8_t*& u, int& u_stride,
                                  const uint8_t*& v, int& v_stride,
                                  int& width, int& height) const {
-    // Software path only — HW path produces NV12, see
-    // last_frame_nv12() for that.
+    // CPU planes are only exposed for software output.
     if (!impl_ || !impl_->last_is_yuv420 || impl_->last_w == 0 ||
         impl_->frame_is_hw || !impl_->frame) return false;
     y = impl_->frame->data[0]; y_stride = impl_->frame->linesize[0];
@@ -672,26 +556,10 @@ bool H264Decoder::last_frame_yuv(const uint8_t*& y, int& y_stride,
     return y && u && v;
 }
 
-bool H264Decoder::last_frame_nv12(const uint8_t*& y,  int& y_stride,
-                                  const uint8_t*& uv, int& uv_stride,
-                                  int& width, int& height) const {
-    if (!impl_ || !impl_->frame_is_hw || !impl_->sw_frame ||
-        impl_->last_w == 0) return false;
-    if (impl_->sw_frame->format != AV_PIX_FMT_NV12) return false;
-    y         = impl_->sw_frame->data[0];
-    y_stride  = impl_->sw_frame->linesize[0];
-    uv        = impl_->sw_frame->data[1];
-    uv_stride = impl_->sw_frame->linesize[1];
-    width  = impl_->last_w;
-    height = impl_->last_h;
-    return y && uv;
-}
-
 const AVFrame* H264Decoder::current_avframe() const {
     if (!impl_ || impl_->last_w == 0) return nullptr;
-    // HW path: sw_frame holds the post-transfer NV12 buffer.
-    // Software path: the decoder output AVFrame (YUV420P / YUVJ420P).
-    return impl_->frame_is_hw ? impl_->sw_frame : impl_->frame;
+    // Return the original CPU or GPU output, without transferring pixels.
+    return impl_->frame;
 }
 
 uint64_t H264Decoder::frames_decoded() const { return impl_ ? impl_->frames_out : 0; }

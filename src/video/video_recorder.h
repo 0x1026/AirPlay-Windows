@@ -31,6 +31,8 @@ public:
         uint64_t    frames = 0;
         uint64_t    dropped = 0;
         uint64_t    audio_samples = 0;
+        uint64_t    readback_frames = 0;
+        bool        gpu_resident = false;
         int64_t     elapsed_ms = 0;
         std::string output_path;
         std::string codec;
@@ -87,6 +89,8 @@ private:
     std::atomic<uint64_t>   frames_written_{0};
     std::atomic<uint64_t>   frames_dropped_{0};
     std::atomic<uint64_t>   audio_samples_written_{0};
+    std::atomic<uint64_t>   readback_frames_{0};
+    std::atomic<bool>       gpu_resident_{false};
     std::atomic<int64_t>    started_ns_{0};
 };
 

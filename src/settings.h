@@ -21,6 +21,7 @@ struct PersistentSettings {
     bool vsync_enabled  = true;
     bool fullscreen     = false;
     bool chromeless     = false;
+    int video_rotation  = -1; // -1: follow stream; 0..3: clockwise quarter turns
 };
 
 std::filesystem::path settings_path();

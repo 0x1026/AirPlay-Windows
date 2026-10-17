@@ -9,6 +9,10 @@
 #include <sstream>
 #include <vector>
 
+extern "C" {
+#include <libavutil/buffer.h>
+}
+
 #if defined(_WIN32)
     #include <winsock2.h>
     #include <ws2tcpip.h>
@@ -211,7 +215,10 @@ bool MirrorListener::enable_decrypt(
         return false;
     }
     decoder_ = std::make_unique<ap::video::H264Decoder>();
-    if (!decoder_->init(hwaccel)) {
+    AVBufferRef* render_device = hwaccel && renderer_ ? renderer_->gpu_device_ref() : nullptr;
+    const bool decoder_ready = decoder_->init(hwaccel, render_device);
+    av_buffer_unref(&render_device);
+    if (!decoder_ready) {
         LOG_WARN << "H264Decoder init failed — decrypted NALs will be logged "
                     "but not decoded";
         decoder_.reset();
@@ -502,13 +509,8 @@ void MirrorListener::reader_loop(socket_t client) {
                                          << " frames (" << dw << 'x' << dh << ')';
                             }
 
-                            // Hand the renderer a refcounted clone of
-                            // libavcodec's most recent AVFrame. Both the
-                            // software (I420) and hwaccel (NV12 post
-                            // sw-transfer) paths land in the same slot —
-                            // the renderer reads frame->data/linesize
-                            // directly, so the YUV planes never get
-                            // memcpy'd between decode and SDL upload.
+                            // Share a ref to the decoded frame: CPU planes
+                            // for software, resident D3D11 surfaces for GPU.
                             if (renderer_) {
                                 if (const AVFrame* af = decoder_->current_avframe()) {
                                     renderer_->push_avframe(af, origin_ns);

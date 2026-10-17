@@ -8,6 +8,7 @@
 
 extern "C" {
 struct AVFrame;
+struct AVBufferRef;
 }
 
 namespace ap::video {
@@ -39,11 +40,9 @@ public:
     // SPS_PPS frame — because we now advertise bit 42 / HEVC — the
     // decoder transparently switches to H.265 via reinit_for_hevc().
     //
-    // hwaccel=true requests D3D11VA hardware decoding on Windows
-    // (GPU-side decode + sys-memory transfer + NV12→I420 conversion).
-    // Falls back transparently to software when the platform / driver
-    // can't honor it.
-    bool init(bool hwaccel = false);
+    // hwaccel=true uses the renderer's shared D3D11VA device. Frames stay
+    // in GPU memory. Without a render device, decoding uses software.
+    bool init(bool hwaccel = false, AVBufferRef* render_device = nullptr);
 
     // Parse SPS/PPS out of an avcC (H.264) or hvcC (HEVC) blob iOS
     // sent as an SPS_PPS mirror frame, caching them as Annex-B bytes
@@ -67,19 +66,10 @@ public:
                         const uint8_t*& v, int& v_stride,
                         int& width, int& height) const;
 
-    // Raw NV12 plane pointers (Y + interleaved UV) to the most recently
-    // decoded frame, when the decoder pulled it from D3D11VA. Returns
-    // false on the software path (use last_frame_yuv() there) or when
-    // no HW frame is available. Skipping the NV12→I420 sws conversion
-    // saves a CPU pass per frame at 4K.
-    bool last_frame_nv12(const uint8_t*& y,  int& y_stride,
-                         const uint8_t*& uv, int& uv_stride,
-                         int& width, int& height) const;
-
-    // The most recently decoded frame, in system memory:
+    // The most recently decoded frame:
     //   - software path: the libavcodec output (typically
     //     AV_PIX_FMT_YUV420P / YUVJ420P)
-    //   - hwaccel path: the post-transfer NV12 frame (cuvid, D3D11VA)
+    //   - hwaccel path: a resident AV_PIX_FMT_D3D11 decoder surface
     // Only valid until the next decode() call. Returned as a
     // const pointer so the renderer can av_frame_ref / clone
     // without touching decoder state. Returns nullptr until a

@@ -1,11 +1,11 @@
 name: Release
 
 # Builds the Windows binary on a GitHub-hosted Windows runner and
-# attaches a zipped Release/ folder to a draft GitHub Release.
+# publishes a Windows ZIP and checksum in a GitHub Release.
 #
 # Triggers:
 #   - Push of a tag matching v* (e.g. v0.1.0): creates / updates the
-#     draft release for that tag with the artifact attached.
+#     release for that tag with the artifact attached.
 #   - Manual workflow_dispatch from the Actions tab: builds the
 #     binary and uploads it as a workflow artifact only.
 
@@ -73,7 +73,14 @@ jobs:
             $tag = "dev-$($env:GITHUB_SHA.Substring(0,7))"
           }
           $zipName = "airplay-windows-$tag-x64.zip"
-          Compress-Archive -Path build\Release\* -DestinationPath $zipName -Force
+          $packageDir = Join-Path $env:RUNNER_TEMP "airplay-release-$tag"
+          New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+          Copy-Item -LiteralPath build\Release\airplay-windows.exe -Destination $packageDir
+          Get-ChildItem build\Release -Filter *.dll -File | Copy-Item -Destination $packageDir
+          Copy-Item -LiteralPath README.md, THIRD_PARTY_NOTICES.md -Destination $packageDir
+          Compress-Archive -Path "$packageDir\*" -DestinationPath $zipName -Force
+          $hash = (Get-FileHash -LiteralPath $zipName -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $zipName" | Set-Content -Path "$zipName.sha256" -Encoding ascii
           "ZIP_PATH=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
           "ZIP_NAME=$zipName" | Out-File -FilePath $env:GITHUB_ENV -Append
           Get-ChildItem $zipName | Format-List Name, Length
@@ -82,14 +89,30 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ZIP_NAME }}
-          path: ${{ env.ZIP_PATH }}
+          path: |
+            ${{ env.ZIP_PATH }}
+            ${{ env.ZIP_PATH }}.sha256
           retention-days: 30
 
-      - name: Create / update draft release
+      - name: Find release notes
+        id: release_notes
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $notes = "docs/releases/${{ github.ref_name }}.md"
+          if (Test-Path -LiteralPath $notes) {
+            "path=$notes" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.ZIP_PATH }}
-          draft: true
+          files: |
+            ${{ env.ZIP_PATH }}
+            ${{ env.ZIP_PATH }}.sha256
+          draft: false
+          fail_on_unmatched_files: true
+          body_path: ${{ steps.release_notes.outputs.path }}
           generate_release_notes: true
-          name: ${{ github.ref_name }}
+          name: AirPlay Windows ${{ github.ref_name }}
