@@ -111,6 +111,8 @@ private:
     int      big_pkts_logged_{0};
 
     std::vector<bool> seen_seq_ = std::vector<bool>(65536, false);
+    uint16_t highest_seq_{0};
+    bool have_highest_seq_{false};
 };
 
 // Human-readable label for a RAOP "ct" (compression type) value.

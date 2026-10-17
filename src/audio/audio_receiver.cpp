@@ -203,6 +203,8 @@ bool AudioReceiver::start(Config cfg) {
     hist_513_plus_         = 0;
     big_pkts_logged_       = 0;
     std::fill(seen_seq_.begin(), seen_seq_.end(), false);
+    highest_seq_ = 0;
+    have_highest_seq_ = false;
 
     running_.store(true, std::memory_order_release);
 
@@ -387,19 +389,35 @@ void AudioReceiver::process_audio_packet(const unsigned char* packet, int len) {
         return;
     }
 
-    // Deduplicate the RTP audio sequence before spending work on AES/FFmpeg.
+    // Advance the deduplication window by RTP sequence, not packet count.
+    // Duplicates/preroll can skip a count-based cleanup and leave stale bits
+    // that reject new audio after the 16-bit sequence number wraps.
+    constexpr uint16_t kSequenceWindow = 8192;
+    if (!have_highest_seq_) {
+        highest_seq_ = seq;
+        have_highest_seq_ = true;
+    } else {
+        const uint16_t advance = static_cast<uint16_t>(seq - highest_seq_);
+        if (advance != 0 && advance < 0x8000) {
+            if (advance >= kSequenceWindow) {
+                std::fill(seen_seq_.begin(), seen_seq_.end(), false);
+            } else {
+                for (uint16_t step = 1; step <= advance; ++step) {
+                    seen_seq_[static_cast<uint16_t>(
+                        highest_seq_ + step - kSequenceWindow)] = false;
+                }
+            }
+            highest_seq_ = seq;
+        } else if (static_cast<uint16_t>(highest_seq_ - seq) >= kSequenceWindow) {
+            ++dedup_dropped_;
+            return; // Too old to belong to the retained reorder window.
+        }
+    }
     if (seen_seq_[seq]) {
         ++dedup_dropped_;
         return;
     }
     seen_seq_[seq] = true;
-
-    if ((pkts_ & 0x3ff) == 0) {
-        const uint16_t erase_from = static_cast<uint16_t>(seq - 8192);
-        for (int k = 0; k < 1024; ++k) {
-            seen_seq_[static_cast<uint16_t>(erase_from + k)] = false;
-        }
-    }
 
     const int encrypted_len = (payload_len / 16) * 16;
     const int tail_len      = payload_len - encrypted_len;
