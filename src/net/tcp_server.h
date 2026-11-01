@@ -3,10 +3,11 @@
 #include "net/socket.h"
 
 #include <atomic>
-#include <cstddef>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
-#include <set>
+#include <map>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -15,14 +16,13 @@ namespace ap::net {
 
 struct ClientSocket {
     socket_t fd = INVALID_SOCK;
+    std::shared_ptr<std::atomic<bool>> cancelled = std::make_shared<std::atomic<bool>>(false);
     std::string peer;   // "ip:port"
 };
 
 // Minimal blocking TCP server. Each accepted client runs on its own thread
-// calling `handler(client)`. The handler owns the socket and must close it.
-//
-// stop() prevents new connections, interrupts all currently-connected client
-// sockets so their blocking recv() calls wake up, then joins every worker.
+// calling `handler(client)`. The socket is borrowed; the server closes it after the handler returns.
+// Stop() joins all client threads and closes the listener.
 class TcpServer {
 public:
     using Handler = std::function<void(ClientSocket)>;
@@ -30,41 +30,38 @@ public:
     TcpServer() = default;
     ~TcpServer();
 
-    TcpServer(const TcpServer&)            = delete;
-    TcpServer& operator=(const TcpServer&) = delete;
-
     bool start(uint16_t port, Handler handler);
     void stop();
 
-    // Forcibly shutdown every currently-connected client socket. The
-    // handler thread sees recv() return 0 / error and tears down its
-    // session naturally. Listener stays up — new connections can still
-    // be accepted. Used by the "Disconnect" button to drop an active
-    // AirPlay session on demand.
-    void close_all_clients();
+    // Cancel active handlers and shut down their transports. Handlers must
+    // use recv_interruptible() (or otherwise observe client.cancelled).
+    // Wait for all session teardown before invoking on_drained. New clients
+    // are rejected until that callback completes. Call outside the render
+    // thread; stop()/close_all_clients() are serialized by the caller.
+    void close_all_clients(const std::function<void()>& on_drained = {});
 
     uint16_t port() const { return port_; }
 
 private:
     void accept_loop();
 
-    // Calls shutdown() on every currently tracked client socket.
-    // Does NOT close the descriptor: ownership remains with the handler,
-    // which closes it during normal session teardown.
-    std::size_t shutdown_active_clients();
-
     socket_t listener_{INVALID_SOCK};
     uint16_t port_{0};
     std::thread accept_thread_;
     std::atomic<bool> running_{false};
-    std::vector<std::thread> workers_;
+    struct Worker {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> finished;
+    };
+    std::vector<Worker> workers_;
     Handler handler_;
 
-    // Tracked here so stop()/Disconnect can interrupt blocking client
-    // handlers from another thread. Entries are erased by the worker
-    // when its handler returns.
-    std::mutex         clients_mtx_;
-    std::set<socket_t> active_clients_;
+    // Workers close and erase under the same lock to prevent descriptor
+    // reuse from racing a concurrent disconnect request.
+    std::mutex          clients_mtx_;
+    std::condition_variable clients_cv_;
+    bool disconnecting_{false};
+    std::map<socket_t, std::shared_ptr<std::atomic<bool>>> active_clients_;
 };
 
 } // namespace ap::net

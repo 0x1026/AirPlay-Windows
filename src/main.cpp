@@ -16,6 +16,9 @@
 #include "mdns/mdns_service.h"
 #include "net/socket.h"
 #include "settings.h"
+#include "airplay/receiver_name.h"
+#include "platform/single_instance.h"
+#include "platform/firewall.h"
 #include "usb/usb_supervisor.h"
 #include "video/video_renderer.h"
 
@@ -26,6 +29,8 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <optional>
+#include <mutex>
 #include <csignal>
 #include <functional>
 #include <mutex>
@@ -448,7 +453,9 @@ int main(int argc, char** argv) {
     // default. With --log, attach to the parent terminal if we were
     // launched from one (cmd, powershell, terminal); otherwise spawn
     // a fresh console window so the user sees the stderr stream.
-    if (ap::is_log_enabled() || show_help) {
+    const DWORD log_handle_type = GetFileType(GetStdHandle(STD_ERROR_HANDLE));
+    const bool log_redirected = log_handle_type == FILE_TYPE_DISK || log_handle_type == FILE_TYPE_PIPE;
+    if ((ap::is_log_enabled() || show_help) && !log_redirected) {
         if (!AttachConsole(ATTACH_PARENT_PROCESS)) AllocConsole();
         FILE* dummy = nullptr;
         freopen_s(&dummy, "CONOUT$", "w", stdout);
@@ -463,8 +470,11 @@ int main(int argc, char** argv) {
     // server/tray instance. The --start-hidden Startup shortcut is treated
     // as a background launch and therefore does not force an existing
     // renderer window open.
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--configure-firewall")
+            return ap::platform::configure_firewall();
     SingleInstanceGuard single_instance;
-    if (!single_instance.acquire(!early_start_hidden)) {
+    if (!show_help && !single_instance.acquire(!early_start_hidden)) {
         return 0;
     }
 #endif
@@ -517,7 +527,8 @@ int main(int argc, char** argv) {
             } else {
                 value = arg.substr(7);
             }
-            if (!ap::valid_receiver_name(value)) {
+            value = ap::airplay::normalize_receiver_name(value);
+            if (value.empty()) {
                 const char* error = "--name requires 1-50 UTF-8 bytes, without "
                     "control characters, dots, backslashes or outer spaces.";
                 std::fprintf(stderr, "%s\n", error);
@@ -608,6 +619,7 @@ int main(int argc, char** argv) {
     // /info reads them on every iPhone handshake (so changes take
     // effect on the next reconnect).
     ap::airplay::LiveSettings live_settings;
+    live_settings.set_receiver_name(receiver_name);
     live_settings.mirror_width.store(mirror_w);
     live_settings.mirror_height.store(mirror_h);
     live_settings.hevc_enabled.store(saved.hevc_enabled);
@@ -618,6 +630,7 @@ int main(int argc, char** argv) {
     live_settings.fullscreen.store(saved.fullscreen);
     live_settings.chromeless.store(saved.chromeless);
     live_settings.video_rotation.store(saved.video_rotation);
+    live_settings.set_ui_preferences(saved.ui);
     ctx.live = &live_settings;
     LOG_INFO << "AirPlay Streaming HLS path: "
              << (hls_playback ? "ENABLED (--hls-proxy-playback)"
@@ -687,15 +700,20 @@ int main(int argc, char** argv) {
         ap::net::global_shutdown();
         return 1;
     }
-    // Wire the toolbar "Disconnect" button. Closing the RTSP TCP
-    // sockets cascades into the per-session cleanup that tears down
-    // mirror + audio without a process restart. We also wipe the
-    // renderer's session state directly because a forced TCP close
-    // doesn't go through the normal TEARDOWN path that would do it.
-    renderer.set_disconnect_handler([&server, &renderer]() {
-        server.disconnect_clients();
-        renderer.clear_session();
-        renderer.clear_active_device();
+    // Keep the render thread available while workers finish GPU/audio teardown.
+    std::atomic<bool> disconnect_requested{false};
+    renderer.set_disconnect_handler([&disconnect_requested]() {
+        disconnect_requested.store(true);
+    });
+
+    struct AudioRequest { ap::airplay::MediaCommand command; uint32_t position; std::string session_id; };
+    std::mutex audio_request_mutex;
+    std::optional<AudioRequest> audio_request;
+    renderer.set_audio_control_handler([&](ap::airplay::MediaCommand command, uint32_t position) {
+        ap::video::VideoRenderer::DeviceInfo device;
+        renderer.active_device_snapshot(device);
+        std::lock_guard<std::mutex> lock(audio_request_mutex);
+        audio_request = AudioRequest{command, position, device.session_id};
     });
 
     // Local HTTP proxy + libavformat player only when the HLS path is
@@ -724,16 +742,48 @@ int main(int argc, char** argv) {
     ap::usb::UsbSupervisor usb_supervisor;
     usb_supervisor.start();
 
-    if (tray_available) {
-        LOG_INFO << "Ready. Window close hides to tray; use tray Exit or Ctrl-C to exit.";
-        while (!g_stop) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    LOG_INFO << "Ready. Close the window or press Ctrl-C to exit.";
+    auto last_saved_settings = ap::snapshot(live_settings);
+    auto observed_settings = last_saved_settings;
+    auto settings_changed_at = std::chrono::steady_clock::now();
+    while (!g_stop && (tray_available || !renderer.user_closed())) {
+        const auto receiver_name = live_settings.receiver_name();
+        if (receiver_name != ctx.name) {
+            mdns.stop();
+            ctx.name = receiver_name;
+            renderer.set_idle_info(ctx.name, display_ip);
+            if (!mdns.start(ctx, server.port()))
+                LOG_WARN << "Could not advertise the new receiver name";
         }
-    } else {
-        LOG_INFO << "Ready. Close the window or press Ctrl-C to exit.";
-        while (!g_stop && !renderer.user_closed()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        if (disconnect_requested.exchange(false)) {
+            LOG_INFO << "Disconnect requested by toolbar";
+            server.disconnect_clients();
+            LOG_INFO << "Disconnect completed: all client handlers drained";
         }
+        std::optional<AudioRequest> request;
+        {
+            std::lock_guard<std::mutex> lock(audio_request_mutex);
+            request.swap(audio_request);
+        }
+        if (request) {
+            const bool success = server.control_audio(request->command, request->position, request->session_id);
+            renderer.audio_command_finished(success);
+        }
+        ap::video::VideoRenderer::DeviceInfo current_device;
+        renderer.active_device_snapshot(current_device);
+        renderer.set_audio_control_available(server.audio_control_available(current_device.session_id));
+        const auto current_settings = ap::snapshot(live_settings);
+        const auto settings_now = std::chrono::steady_clock::now();
+        if (!(current_settings == observed_settings)) {
+            observed_settings = current_settings;
+            settings_changed_at = settings_now;
+        }
+        if (!(current_settings == last_saved_settings) &&
+            settings_now - settings_changed_at >= std::chrono::milliseconds(500)) {
+            if (ap::save_settings(current_settings)) last_saved_settings = current_settings;
+            settings_changed_at = settings_now;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     LOG_INFO << "Shutting down... (g_stop=" << g_stop.load()
@@ -741,36 +791,18 @@ int main(int argc, char** argv) {
 #if defined(_WIN32)
     tray.stop();
 #endif
-    LOG_INFO << "shutdown: stopping USB supervisor";
-    usb_supervisor.stop();
-    LOG_INFO << "shutdown: USB supervisor stopped";
-
-    LOG_INFO << "shutdown: stopping mDNS";
+    // Withdraw discovery and interrupt sessions before stopping peripherals.
+    server.stop();
     mdns.stop();
-    LOG_INFO << "shutdown: mDNS stopped";
-
-    LOG_INFO << "shutdown: stopping HLS player";
+    usb_supervisor.stop();
     hls_player.stop();
     LOG_INFO << "shutdown: HLS player stopped";
 
     LOG_INFO << "shutdown: stopping HLS server";
     hls_server.stop();
-    LOG_INFO << "shutdown: HLS server stopped";
-
-    LOG_INFO << "shutdown: stopping AirPlay server";
-    server.stop();
-    LOG_INFO << "shutdown: AirPlay server stopped";
-
-    auto final_settings = ap::snapshot(live_settings);
-    final_settings.receiver_name = ctx.name;
-    ap::save_settings(final_settings);
-
     renderer.stop();
-
-    // Final global SDL cleanup: by this point both video and AirPlay audio
-    // users are fully stopped, so no live device can be invalidated.
+    ap::save_settings(ap::snapshot(live_settings));
     SDL_Quit();
-
     ap::net::global_shutdown();
     return 0;
 }

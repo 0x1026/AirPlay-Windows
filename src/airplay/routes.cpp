@@ -9,6 +9,7 @@
 #include "airplay/reverse_channel.h"
 #include "airplay/sdp.h"
 #include "airplay/streams.h"
+#include "audio/rtp_flush.h"
 #include "crypto/fairplay.h"
 #include "crypto/pair_verify.h"
 #include "log.h"
@@ -118,7 +119,8 @@ Response handle_info(const DeviceContext& ctx, const Request& req) {
     } else {
         // Degraded fallback (libplist missing at build time).
         r.set_header("Content-Type", "text/plain");
-        std::string s = "name=" + ctx.name + "\ndeviceid=" + ctx.deviceid + '\n';
+        std::string s = "name=" + (ctx.live ? ctx.live->receiver_name() : ctx.name)
+                      + "\ndeviceid=" + ctx.deviceid + '\n';
         r.body.assign(s.begin(), s.end());
         LOG_WARN << "/info serving text fallback — iOS won't accept this";
     }
@@ -507,12 +509,8 @@ Response handle_record(ClientSession& session, const Request& req) {
     }
     // iOS expects Session on RECORD response as well.
     r.set_header("Session", session.streams->session_id());
-    // TODO: once FairPlay blobs are provisioned and stream keys decrypted,
-    // spin up workers here that read from the bound UDP sockets. For now
-    // iOS's packets queue in the kernel — enough to confirm via Wireshark
-    // that the client did reach RECORD and is actively pushing media.
-    LOG_INFO << "RECORD: session=" << session.streams->session_id()
-             << " — stream worker not started (FairPlay blobs required)";
+    // Media workers are started by SETUP, once stream keys are available.
+    LOG_INFO << "RECORD: session=" << session.streams->session_id();
     // Resume-from-FLUSH path: iOS pauses with FLUSH and restarts the
     // stream with RECORD, so bring the "playing" flag back to true.
     if (session.renderer) session.renderer->push_playback_rate(1.0f);
@@ -673,6 +671,7 @@ Response handle_set_parameter(ClientSession& session, const Request& req) {
                 }
                 session.last_progress_start = start;
                 session.last_progress_curr  = curr;
+                LOG_INFO << "Audio progress RTP: " << start << '/' << curr << '/' << end;
 
                 LOG_INFO << "playback " << (elapsed_ms / 1000) << "s / "
                          << (total_ms / 1000) << "s";
@@ -713,6 +712,8 @@ Response handle_set_parameter(ClientSession& session, const Request& req) {
         (req.body.size() >= 4 && std::memcmp(req.body.data(), "mlit", 4) == 0)) {
         DaapMetadata md;
         if (parse_daap_mlit(req.body.data(), req.body.size(), md)) {
+            if (session.streams && !md.title.empty())
+                session.streams->set_audio_track(md.title + '\n' + md.artist + '\n' + md.album);
             LOG_INFO << "metadata: \"" << md.title
                      << "\" — " << md.artist
                      << " (" << md.album
@@ -1492,6 +1493,9 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     // FLUSH only shows pause for a fraction of a frame.
     if (req.method == "FLUSH" || req.method == "PAUSE") {
         LOG_INFO << req.method << ": tentative pause";
+        const auto rtp_info = req.header("rtp-info");
+        LOG_INFO << "FLUSH RTP-Info: " << rtp_info.substr(0, 128);
+        if (session.streams) session.streams->flush_audio(ap::audio::flush_timestamp(rtp_info));
         if (session.renderer) {
             session.renderer->note_flush();
             session.renderer->push_playback_rate(0.0f);
@@ -1529,6 +1533,7 @@ Response dispatch(const DeviceContext& ctx, ClientSession& session,
     if (req.method == "POST" && path == "/reverse")          return handle_reverse(session, req);
     if (req.method == "GET"  && path == "/server-info")      return handle_server_info(ctx, req);
     if (req.method == "POST" && path == "/audioMode")        {
+        if (session.streams) session.streams->resume_audio();
         // Observed as the resume-from-pause signal on some iOS flows
         // (no RECORD, no new SETUP — just an audioMode announcement
         // followed by the RTP stream kicking back in). Flip the renderer

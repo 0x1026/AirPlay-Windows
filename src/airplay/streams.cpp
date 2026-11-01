@@ -194,6 +194,9 @@ bool StreamSession::setup_stream(int type,
     if (type == 110) {
         mirror_ = std::make_unique<MirrorListener>();
 
+        // Decoder initialization needs the renderer's D3D11 device.
+        if (renderer_) mirror_->attach_renderer(renderer_);
+
         // Wire AES-CTR decryption before starting the accept loop.
         if (!opts.aes_key.empty() && opts.stream_connection_id != 0) {
             if (!mirror_->enable_decrypt(opts.aes_key, opts.stream_connection_id,
@@ -202,7 +205,6 @@ bool StreamSession::setup_stream(int type,
                             "(stream will be logged encrypted)";
             }
         }
-        if (renderer_) mirror_->attach_renderer(renderer_);
 
         uint16_t p = 0;
         if (!mirror_->start(p)) {
@@ -210,6 +212,7 @@ bool StreamSession::setup_stream(int type,
             return false;
         }
         data_port = p;
+        if (audio_) audio_->set_synchronized(false);
 
         StreamChannel ch;
         ch.type         = type;
@@ -238,31 +241,35 @@ bool StreamSession::setup_stream(int type,
         // clock mapping established by the session-level SETUP.
         audio_ = std::make_unique<ap::audio::AudioReceiver>();
         ap::audio::AudioReceiver::Config ac;
-        ac.data_sock    = d_sock;
+        ac.data_sock   = d_sock;
         ac.control_sock = c_sock;
-        ac.aes_key      = opts.aes_key;
-        ac.aes_iv       = opts.aes_iv;
-        ac.ct           = opts.ct;
-        ac.sample_rate  = opts.sample_rate;
-        ac.ntp          = ntp_.get();
-        ac.renderer     = renderer_;
-
-        if (!audio_->start(std::move(ac))) {
-            LOG_WARN << "SETUP stream 96: AudioReceiver failed to start";
-            // start() does not take ownership on failure.
+        ac.ntp = ntp_.get();
+        ac.synchronize = mirror_ == nullptr;
+        ac.aes_key     = opts.aes_key;
+        ac.aes_iv      = opts.aes_iv;
+        ac.ct          = opts.ct;
+        ac.sample_rate = opts.sample_rate;
+        ac.renderer    = renderer_;
+        if (!audio_->start(std::move(ac), std::move(paused_audio_))) {
+            LOG_WARN << "SETUP stream 96: AudioReceiver failed to start "
+                        "(UDP socket left bound, no decrypt)";
+            // If start() failed before taking ownership, we close the sock here.
             ap::net::close_socket(d_sock);
             ap::net::close_socket(c_sock);
             audio_.reset();
             return false;
         }
 
+        // AudioReceiver borrows the control socket to read RTP/NTP anchors.
+        // Keep ownership here; stop the receiver before closing it.
         StreamChannel ch;
         ch.type         = type;
         ch.data_port    = d_port;
         ch.control_port = c_port;
         ch.data_sock    = INVALID_SOCK;   // owned by AudioReceiver
-        ch.control_sock = INVALID_SOCK;   // owned by AudioReceiver
+        ch.control_sock = c_sock;         // borrowed by AudioReceiver
         channels_.push_back(ch);
+        audio_control_session_ = true;
         return true;
     }
 
@@ -282,9 +289,10 @@ void StreamSession::stop_stream(int type) {
     if (type == 110 && mirror_) {
         mirror_->stop();
         mirror_.reset();
+        if (audio_) audio_->set_synchronized(true);
     }
     if (type == 96 && audio_) {
-        audio_->stop();
+        paused_audio_ = audio_->suspend();
         audio_.reset();
     }
     // Remove any audio channels matching the type.
@@ -313,28 +321,51 @@ bool StreamSession::start_ntp(const std::string& remote_ip, uint16_t remote_port
         LOG_ERROR << "start_ntp: timing socket not bound (call setup_session first)";
         return false;
     }
-    ntp_ = std::make_unique<NtpClient>();
-    if (!ntp_->start(ap2_timing_sock, remote_ip, remote_port)) {
-        ntp_.reset();
-        return false;
-    }
-    return true;
+    // Preserve the address borrowed by an active AudioReceiver on repeated SETUP.
+    if (!ntp_) ntp_ = std::make_unique<NtpClient>();
+    else ntp_->stop();
+    return ntp_->start(ap2_timing_sock, remote_ip, remote_port);
 }
 
 void StreamSession::set_audio_volume_db(float db) {
     if (audio_) audio_->set_volume_db(db);
 }
 
+void StreamSession::flush_audio(std::optional<uint32_t> boundary) {
+    if (audio_) audio_->flush(boundary);
+}
+
+void StreamSession::resume_audio() {
+    if (audio_) audio_->resume();
+}
+
+void StreamSession::set_audio_track(const std::string& track) {
+    if (!audio_track_.empty() && track != audio_track_) {
+        paused_audio_ = {};
+        if (audio_) audio_->discard_pause();
+    }
+    audio_track_ = track;
+}
+
+bool StreamSession::audio_only() const {
+    if (mirror_) return false;
+    if (audio_control_session_) return true;
+    if (audio_) return true;
+    for (const auto& channel : channels_) if (channel.type == 96) return true;
+    return false;
+}
+
 void StreamSession::teardown() {
+    audio_control_session_ = false;
+    paused_audio_ = {};
+    audio_track_.clear();
     LOG_INFO << "StreamSession::teardown begin session=" << session_id_
              << " ntp=" << (ntp_ ? "yes" : "no")
              << " mirror=" << (mirror_ ? "yes" : "no")
              << " audio=" << (audio_ ? "yes" : "no")
              << " channels=" << channels_.size();
-    // AudioReceiver holds a non-owning NtpClient pointer for timestamped
-    // playout, so stop audio before destroying the NTP clock.
-    if (audio_)  { LOG_INFO << "teardown: audio stop"; audio_->stop();  audio_.reset(); }
     if (mirror_) { LOG_INFO << "teardown: mirror stop"; mirror_->stop(); mirror_.reset(); }
+    if (audio_)  { LOG_INFO << "teardown: audio stop"; audio_->stop();  audio_.reset(); }
     if (ntp_)    { LOG_INFO << "teardown: ntp stop"; ntp_->stop(); ntp_.reset(); }
 
     if (event_channel_) {
@@ -343,6 +374,7 @@ void StreamSession::teardown() {
         event_channel_->stop();
         event_channel_.reset();
     }
+
 
     LOG_INFO << "teardown: closing session sockets";
     for (auto* sp : { &data_sock_, &ctrl_sock_, &timing_sock_,

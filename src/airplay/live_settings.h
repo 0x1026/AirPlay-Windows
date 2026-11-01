@@ -1,6 +1,9 @@
 #pragma once
+#include "settings.h"
 
 #include <atomic>
+#include <mutex>
+#include <string>
 
 namespace ap::airplay {
 
@@ -11,10 +14,25 @@ namespace ap::airplay {
 // so the overlay can change values that take effect on the next
 // iPhone /info request — practically: on the next reconnect.
 //
-// Atomics on every field so the writer (UI thread) and the readers
-// (RTSP server thread serving /info) never race; values are
-// independent so a torn write across them is harmless.
+// Numeric fields are atomic; the receiver name is protected by a mutex.
+// The UI and RTSP threads can access these independently without racing.
 struct LiveSettings {
+    ap::UiPreferences ui_preferences() const {
+        std::lock_guard<std::mutex> lock(ui_mutex_);
+        return ui_preferences_;
+    }
+    void set_ui_preferences(const ap::UiPreferences& value) {
+        std::lock_guard<std::mutex> lock(ui_mutex_);
+        ui_preferences_ = value;
+    }
+    std::string receiver_name() const {
+        std::lock_guard<std::mutex> lock(name_mutex_);
+        return receiver_name_;
+    }
+    void set_receiver_name(const std::string& name) {
+        std::lock_guard<std::mutex> lock(name_mutex_);
+        receiver_name_ = name;
+    }
     // Display box advertised in /info — see DeviceContext::mirror_*.
     std::atomic<int>  mirror_width{2560};
     std::atomic<int>  mirror_height{1440};
@@ -35,10 +53,10 @@ struct LiveSettings {
     std::atomic<int>  max_fps{60};
     std::atomic<int>  refresh_rate{60};
 
-    // False: software decoding (default). True: D3D11VA decoding,
+    // False: software decoding. True (default): D3D11VA decoding,
     // GPU color conversion and shared-texture presentation on the
     // same GPU adapter, without CPU readback for display.
-    std::atomic<bool> mirror_hwaccel{false};
+    std::atomic<bool> mirror_hwaccel{true};
 
     // SDL_RENDERER_PRESENTVSYNC. False → present immediately when a
     // frame is ready, lower latency (up to ~16 ms saved at 60 Hz)
@@ -52,6 +70,12 @@ struct LiveSettings {
     // Display only: -1 follows the orientation encoded by iOS; 0..3 adds
     // clockwise quarter turns to the received image. Recording is unchanged.
     std::atomic<int> video_rotation{-1};
+
+private:
+    mutable std::mutex ui_mutex_;
+    ap::UiPreferences ui_preferences_;
+    mutable std::mutex name_mutex_;
+    std::string receiver_name_ = "AirPlay-Windows";
 };
 
 } // namespace ap::airplay

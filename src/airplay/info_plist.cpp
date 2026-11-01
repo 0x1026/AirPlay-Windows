@@ -239,7 +239,7 @@ std::vector<unsigned char> build_info_plist(const DeviceContext& ctx) {
     set_str(root, "deviceid",      ctx.deviceid);
     set_str(root, "macAddress",    ctx.deviceid);
     set_str(root, "model",         ctx.model);
-    set_str(root, "name",          ctx.name);
+    set_str(root, "name",          ctx.live ? ctx.live->receiver_name() : ctx.name);
     set_str(root, "pi",            ctx.pi);
     set_str(root, "sourceVersion", ctx.srcvers);
     set_uint(root, "features",     feat);
@@ -308,7 +308,7 @@ std::vector<unsigned char> build_event_info_plist(const DeviceContext& ctx) {
     set_bool(root, "canRecordScreenStream", false);
     set_uint(root, "statusFlags", 0x244);
     set_bool(root, "keepAliveSendStatsAsBody", true);
-    set_str(root, "name", ctx.name);
+    set_str(root, "name", ctx.live ? ctx.live->receiver_name() : ctx.name);
     set_str(root, "protocolVersion", "1.1");
     set_uint(root, "volumeControlType", 4);
     set_str(root, "deviceID", ctx.deviceid);
@@ -334,7 +334,9 @@ std::vector<unsigned char> build_event_info_plist(const DeviceContext& ctx) {
     plist_dict_set_item(root, "supportedFormats", supported);
 
     set_str(root, "sourceVersion", ctx.srcvers);
-    set_bool(root, "hasUDPMirroringSupport", true);
+    // Only the classic TCP mirror transport is implemented. Advertising UDP
+    // can select AVConference negotiation that this receiver cannot answer.
+    set_bool(root, "hasUDPMirroringSupport", false);
     set_str(root, "model", ctx.model);
 
     if (!ctx.public_key.empty()) {

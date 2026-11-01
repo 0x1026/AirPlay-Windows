@@ -7,12 +7,14 @@
 
 #if defined(_WIN32)
     #include <iphlpapi.h>
+    #include <mstcpip.h>
     #pragma comment(lib, "ws2_32.lib")
     #pragma comment(lib, "iphlpapi.lib")
 #else
     #include <ifaddrs.h>
     #include <net/if.h>
     #include <netdb.h>
+    #include <netinet/tcp.h>
     #include <errno.h>
 #endif
 
@@ -43,6 +45,35 @@ void close_socket(socket_t s) {
 #else
     ::close(s);
 #endif
+}
+
+bool enable_tcp_keepalive(socket_t s, int idle_seconds, int interval_seconds, int probes) {
+    const int enabled = 1;
+    const auto set = [s](int level, int option, const int& value) {
+        return ::setsockopt(s, level, option,
+            reinterpret_cast<const char*>(&value), sizeof(value)) == 0;
+    };
+    return set(SOL_SOCKET, SO_KEEPALIVE, enabled)
+        && set(IPPROTO_TCP, TCP_KEEPIDLE, idle_seconds)
+        && set(IPPROTO_TCP, TCP_KEEPINTVL, interval_seconds)
+        && set(IPPROTO_TCP, TCP_KEEPCNT, probes);
+}
+
+int recv_interruptible(socket_t s, void* buf, int len, const std::atomic<bool>* cancelled) {
+    // shutdown() alone need not cancel a pending synchronous Winsock recv.
+    // Poll readiness so cancellation is observed without closing/reusing a
+    // descriptor while its worker may still be reading it.
+    while (!cancelled || !cancelled->load()) {
+        fd_set readable;
+        FD_ZERO(&readable);
+        FD_SET(s, &readable);
+        timeval timeout{0, 100000};
+        const int ready = ::select(static_cast<int>(s) + 1, &readable, nullptr, nullptr, &timeout);
+        if (cancelled && cancelled->load()) return -1;
+        if (ready < 0) return -1;
+        if (ready > 0) return ::recv(s, static_cast<char*>(buf), len, 0);
+    }
+    return -1;
 }
 
 int last_error() {

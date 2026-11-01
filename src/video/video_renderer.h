@@ -1,5 +1,6 @@
 #pragma once
 
+#include "airplay/media_control.h"
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -77,6 +78,9 @@ public:
 
     // Tell the thread to exit, join it, tear down SDL.
     void stop();
+
+    // Process window activation on its owning render thread.
+    void request_show() { show_requested_.store(true); }
 
     // Producer entry point. Copies each YUV plane into internal buffers
     // (skipping AVFrame padding via per-plane strides). Thread-safe.
@@ -180,6 +184,8 @@ public:
     };
     void set_active_device(DeviceInfo info);
     void clear_active_device();
+    // Atomically clear only this session, leaving a newer connection intact.
+    bool clear_session_if_active(const std::string& session_id);
     bool active_device_snapshot(DeviceInfo& out) const;
 
     // Hand the renderer a (non-owning) pointer to the user-tunable
@@ -191,6 +197,13 @@ public:
     // Wire the toolbar "Disconnect" button. Invoked from the render
     // thread when the user clicks; should drop every connected
     // AirPlay client (typically Server::disconnect_clients).
+    void set_audio_control_handler(std::function<void(ap::airplay::MediaCommand, uint32_t)> handler);
+    void set_audio_control_available(bool available) { audio_control_available_.store(available); }
+    void audio_command_finished(bool success) {
+        audio_command_failed_.store(!success);
+        audio_command_pending_.store(false);
+    }
+
     void set_disconnect_handler(std::function<void()> h);
 
     // Set true when the user closes the window (SDL_QUIT). main() polls
@@ -201,6 +214,7 @@ private:
     void run(const std::string& title, bool start_hidden);
 
     std::atomic<bool> running_{false};
+    std::atomic<bool> show_requested_{false};
     std::atomic<bool> closed_{false};
     std::atomic<bool> close_hides_{false};
     std::atomic<bool> window_visible_{false};
@@ -315,6 +329,10 @@ private:
     // "Disconnect" click. Empty by default so missing wiring is
     // a silent no-op rather than a crash.
     std::function<void()>      disconnect_handler_;
+    std::function<void(ap::airplay::MediaCommand, uint32_t)> audio_control_handler_;
+    std::atomic<bool> audio_control_available_{false};
+    std::atomic<bool> audio_command_pending_{false};
+    std::atomic<bool> audio_command_failed_{false};
 
     // MP4 writer. Encoding runs on its own bounded worker queue so recording
     // cannot add latency to mirror decode/render.

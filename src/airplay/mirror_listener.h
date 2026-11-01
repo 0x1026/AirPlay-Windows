@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -50,7 +51,8 @@ public:
     // payloads before they are logged. Call BEFORE start(). Pass the audio
     // AES key (from fairplay_decrypt) and the streamConnectionID from the
     // per-stream SETUP entry. `hwaccel` requests D3D11VA on Windows for
-    // the H.264/HEVC decoder.
+    // the H.264/HEVC decoder. Attach the renderer before this call so its
+    // D3D11 device is available when the decoder is initialized.
     bool enable_decrypt(const std::vector<unsigned char>& aes_key_audio,
                         uint64_t stream_connection_id,
                         bool hwaccel = false);
@@ -66,6 +68,8 @@ private:
     socket_t          listen_sock_{INVALID_SOCK};
     std::atomic<bool> running_{false};
     std::thread       thread_;
+    std::mutex        client_mtx_;
+    socket_t          client_sock_{INVALID_SOCK};
 
     std::unique_ptr<ap::crypto::MirrorDecrypt> decrypt_;
     std::unique_ptr<ap::video::H264Decoder>    decoder_;
